@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import threading
 import time
 
 import numpy as np
@@ -170,6 +171,12 @@ SCENES = {"chain": build_chain, "cloth": build_cloth, "stack": build_stack}
 class Viewer:
     def __init__(self, args):
         self.args = args
+        # viser GUI callbacks fire on the server's websocket thread, while the
+        # solver steps on the main thread. Both mutate / reallocate the Warp
+        # arrays, so without a lock a slider or "drop" can free an array mid
+        # kernel-launch → CUDA error 700 (illegal memory access). Serialise all
+        # solver access through this lock (AVBD's viewer does the same).
+        self._lock = threading.RLock()
         self.server = viser.ViserServer(host="0.0.0.0", port=args.port)
         try:
             self.server.scene.set_up_direction("+y")
@@ -181,8 +188,10 @@ class Viewer:
         # ground + grid
         self.server.scene.add_box("/ground", dimensions=(10.0, 0.04, 10.0),
                                   position=(0.0, -0.02, 0.0), color=(0.82, 0.82, 0.82))
+        # Lift the grid a hair above the floor top (both sit at y=0) to avoid
+        # z-fighting between the coplanar grid lines and the ground surface.
         self.server.scene.add_grid("/grid", width=10.0, height=10.0,
-                                  cell_size=0.5, plane="xz")
+                                  cell_size=0.5, plane="xz", position=(0.0, 0.003, 0.0))
 
         self._sphere_node = None
         self._sphere_idx = np.zeros(0, np.int64)
@@ -281,40 +290,48 @@ class Viewer:
         self.g_substeps.on_update(lambda _: setattr(self.solver, "substeps", int(self.g_substeps.value)))
         self.g_iters.on_update(lambda _: setattr(self.solver, "iterations", int(self.g_iters.value)))
         self.g_gravity.on_update(lambda _: setattr(self.solver, "gravity", (0.0, float(self.g_gravity.value), 0.0)))
-        self.g_friction.on_update(lambda _: self.solver.set_all_friction(float(self.g_friction.value)))
+        self.g_friction.on_update(self._friction_changed)
         self.g_mode.on_update(self._mode_changed)
 
+    def _friction_changed(self, _):
+        with self._lock:
+            self.solver.set_all_friction(float(self.g_friction.value))
+
     def _compliance_changed(self, _):
-        self.solver.set_all_compliance(10.0 ** float(self.g_logc.value))
+        with self._lock:
+            self.solver.set_all_compliance(10.0 ** float(self.g_logc.value))
 
     def _mode_changed(self, _):
-        # Switching mode needs a recolor for gs; force a flush.
-        self.solver.solve_mode = str(self.g_mode.value)
-        self.solver._dirty = True
-        self.solver._flush()
+        with self._lock:
+            # Switching mode needs a recolor for gs; force a flush.
+            self.solver.solve_mode = str(self.g_mode.value)
+            self.solver._dirty = True
+            self.solver._flush()
 
     def _kick(self):
-        if self.spec["cloth"]:
-            # wind: a sideways impulse on every free cloth particle
-            for i in range(self.solver.num_bodies):
-                self.solver.add_impulse(Body(i), (2.5, 0.0, 1.5))
-        else:
-            rng = np.random.default_rng()
-            for i in range(self.solver.num_bodies):
-                self.solver.add_impulse(Body(i), (float(rng.uniform(-3, 3)),
-                                                   float(rng.uniform(0, 2)),
-                                                   float(rng.uniform(-3, 3))))
+        with self._lock:
+            if self.spec["cloth"]:
+                # wind: a sideways impulse on every free cloth particle
+                for i in range(self.solver.num_bodies):
+                    self.solver.add_impulse(Body(i), (2.5, 0.0, 1.5))
+            else:
+                rng = np.random.default_rng()
+                for i in range(self.solver.num_bodies):
+                    self.solver.add_impulse(Body(i), (float(rng.uniform(-3, 3)),
+                                                       float(rng.uniform(0, 2)),
+                                                       float(rng.uniform(-3, 3))))
 
     def _drop(self):
-        rng = np.random.default_rng()
-        r = 0.18
-        pos = (float(rng.uniform(-1, 1)), self.args.top_y + 1.0, float(rng.uniform(-1, 1)))
-        b = self.solver.add_particle(pos, mass=1.5, shape=Shape("sphere", (r,)),
-                                     friction=float(self.g_friction.value))
-        self.solver.add_floor_contact(b, floor_y=r, friction=float(self.g_friction.value))
-        self.spec["spheres"].append((b.index, r, _u8((0.2, 0.85, 0.85))))
-        self.solver._flush()
-        self._rebuild_spheres()
+        with self._lock:
+            rng = np.random.default_rng()
+            r = 0.18
+            pos = (float(rng.uniform(-1, 1)), self.args.top_y + 1.0, float(rng.uniform(-1, 1)))
+            b = self.solver.add_particle(pos, mass=1.5, shape=Shape("sphere", (r,)),
+                                         friction=float(self.g_friction.value))
+            self.solver.add_floor_contact(b, floor_y=r, friction=float(self.g_friction.value))
+            self.spec["spheres"].append((b.index, r, _u8((0.2, 0.85, 0.85))))
+            self.solver._flush()
+            self._rebuild_spheres()
 
     def _rebuild_spheres(self):
         if self._sphere_node is not None:
@@ -334,6 +351,7 @@ class Viewer:
         self._sphere_idx = idx
 
     def _reset(self):
+      with self._lock:
         for n in (self._sphere_node, self._link_node, self._cloth_node):
             if n is not None:
                 try:
@@ -357,13 +375,15 @@ class Viewer:
         if self.g_pause.value:
             return
         t0 = time.perf_counter()
-        self.solver.step()
+        with self._lock:
+            self.solver.step()
+            pos = self.solver.positions()
+            sphere_idx = self._sphere_idx
         step_dt = time.perf_counter() - t0
 
-        pos = self.solver.positions()
         with self.server.atomic():
-            if self._sphere_node is not None and len(self._sphere_idx):
-                self._sphere_node.batched_positions = pos[self._sphere_idx].astype(np.float32)
+            if self._sphere_node is not None and len(sphere_idx) and len(pos) > int(sphere_idx.max()):
+                self._sphere_node.batched_positions = pos[sphere_idx].astype(np.float32)
             if self._link_node is not None:
                 self._link_node.points = self._link_points()
             if self._cloth_node is not None:

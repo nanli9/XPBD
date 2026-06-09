@@ -17,7 +17,21 @@ import time
 import numpy as np
 import warp as wp
 
-from xpbd3d import Body, Solver, Shape
+from xpbd3d import Body, Solver, Solver6DOF, Shape
+
+
+def make_box_pile(nx, ny, nz, device, substeps, iterations):
+    s = Solver6DOF(dt=1 / 60, substeps=substeps, iterations=iterations,
+                   device=device, floor_y=0.0, friction=0.6)
+    h = 0.16
+    rng = np.random.default_rng(0)
+    sp = 2.25 * h
+    for ly in range(ny):
+        for ix in range(nx):
+            for iz in range(nz):
+                s.add_box((ix * sp + rng.uniform(-1e-3, 1e-3), h + ly * sp,
+                           iz * sp + rng.uniform(-1e-3, 1e-3)), (h, h, h), mass=1.0)
+    return s
 
 
 def make_cloth(res, device, mode, substeps, iterations):
@@ -109,6 +123,18 @@ def main():
             for n_side, rows in ((4, 3), (6, 4), (8, 5)):
                 s = make_stack(n_side, rows, dev, mode, args.substeps, args.iterations)
                 bench_row(f"stack {n_side}x{n_side}x{rows}", s, args.frames)
+
+        # 6-DOF rigid-body solver (boxes, OBB contacts, CUDA-graph hot loop).
+        print("-- 6-DOF rigid boxes (jacobi + graph capture) --")
+        sizes = (((3, 3, 3), (5, 4, 5), (8, 6, 8), (12, 10, 12))
+                 if str(dev).startswith("cuda") else ((3, 3, 3),))
+        for nx, ny, nz in sizes:
+            s = make_box_pile(nx, ny, nz, dev, args.substeps, args.iterations)
+            for _ in range(30):
+                s.step()
+            ms = time_steps(s, frames=args.frames)
+            print(f"  {'box pile %dx%dx%d' % (nx, ny, nz):28s} boxes={s.num_bodies:5d} "
+                  f"pairs={s.n_pairs:5d} | {ms:7.2f} ms/step | {1000/ms:6.1f} Hz")
 
     if args.profile and any(str(d).startswith("cuda") for d in devices):
         print("\n=== per-kernel CUDA activity (cloth 48x48, jacobi) ===")

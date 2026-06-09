@@ -20,20 +20,25 @@ It ships **two solvers**, mirroring `../AVBD`:
 - **`Solver6DOF`** — full rigid **boxes**: quaternion orientation, rotated
   inertia, OBB (SAT + face-clip) contacts, friction + restitution
   (Müller et al. 2020). Stacks, dominoes, block piles — with a **CUDA-graph
-  captured** hot loop (~5× over per-launch dispatch).
+  captured** hot loop (~5× over per-launch dispatch) and a **GPU LBVH** broad
+  phase. Also handles **particles** (`add_particle`, cloth nodes) and **joints**
+  (`add_joint`, compliant links/pins), so rigid bodies, cloth and articulated
+  chains share one substep loop / one captured graph.
 
 ```bash
 uv sync && uv pip install -e .
 
-uv run pytest tests/ -q                                   # 22 correctness tests
+uv run pytest tests/ -q                                   # 27 correctness tests
 # 3-DOF
 uv run python examples/viewer.py --scene cloth            # the XPBD showcase (CUDA)
 uv run python examples/viewer.py --stress                 # 2048-body particle pile
 # 6-DOF rigid bodies
-uv run python examples/viewer_6dof.py --scene stack       # box tower
-uv run python examples/viewer_6dof.py --scene dominoes    # domino cascade
-uv run python examples/viewer_6dof.py --stress            # 384-box pile (AVBD parity)
-uv run python examples/viewer_6dof.py --mega              # 1440-box pile
+uv run python examples/viewer_6dof.py --scene stack          # box tower
+uv run python examples/viewer_6dof.py --scene dominoes       # domino cascade
+uv run python examples/viewer_6dof.py --scene domino_stress  # many cascading chains
+uv run python examples/viewer_6dof.py --scene unified         # rigid + cloth + joints
+uv run python examples/viewer_6dof.py --stress               # 384-box pile (AVBD parity)
+uv run python examples/viewer_6dof.py --mega                 # 1440-box pile
 uv run python examples/benchmark.py --device cuda:0 --profile
 # open the printed URL (default http://localhost:8080)
 ```
@@ -139,6 +144,8 @@ velocity pass for dynamic friction + restitution.
 | OBB contact manifold (SAT + Sutherland-Hodgman clip) | `generate_box_manifold` |
 | velocity pass: friction Eq. 30 + restitution (§3.6) | `velocity_box`, `velocity_floor` |
 | static friction at position level (§3.5) | in `solve_floor_contacts` |
+| compliant joint `Δλ = (−C − α̃λ)/(w_a+w_b+α̃)` between local anchors (§3.3) | `solve_joints` |
+| GPU LBVH broad phase (per-body AABB + tree query) | `kernels_bvh` (`compute_body_aabb`, `emit_pairs`) |
 
 Contacts use the paper's **Jacobi** projection (atomic accumulate + averaged
 apply) — no graph coloring. Box-box collisions use a face-axis SAT normal with a
@@ -147,32 +154,62 @@ frozen for the solve; corner-vs-OBB is not enough (aligned stacks would collapse
 since a top box's corners sit exactly on the lower box's edges). Edge-edge
 contacts are the known gap, as in AVBD's notes.
 
+### Particles, joints & the unified scene
+
+The same solver runs **cloth and articulated bodies** alongside rigid boxes:
+
+- **`add_particle(pos, mass, radius, group=…)`** — a point mass (zero rotational
+  inertia, so it never spins) modelled as a small box, so it shares the box
+  contact path (floor + OBB) for free. Bodies sharing a `group > 0` skip
+  self-collision, which keeps cloth-vs-itself off while still letting cloth
+  collide with rigid bodies. A draped sheet is just a grid of particles.
+- **`add_joint(a, b, compliance, rest_length=…, anchor_a=…, anchor_b=…)`** — the
+  XPBD compliant positional constraint between anchor points fixed in each
+  body's frame (`solve_joints`). It is *one primitive* that covers cloth edges
+  (particle↔particle, `compliance≈1e-7`), rigid links / pins (`compliance=0`,
+  `rest=0`) and pin-to-rigid attachments (e.g. a cloth's top row pinned to a
+  movable bar). Joints are fixed-topology, so they live inside the captured
+  graph next to the contacts.
+
+The **`unified`** scene exercises all three at once — a rigid block pile, a cloth
+curtain hung from a bar held between two posts by joints, and a 4-link rigid
+pendulum chain — all in one substep loop and one CUDA graph (~730 Hz for ~600
+bodies + 1.6k joints).
+
 ### Performance & the optimization story
 
 Measured on an **RTX 3060 Laptop**, 15 substeps × 1 iteration, true device time.
-The headline optimization is **CUDA-graph capture** of the fixed substep-loop
-kernel sequence (~150 launches/frame collapse to one graph replay):
+Two optimizations stack: **CUDA-graph capture** of the fixed substep-loop kernel
+sequence (~150 launches/frame collapse to one graph replay), then an all-device
+**GPU LBVH** broad phase that removes the per-step host round-trip.
 
-| box pile | boxes | baseline | **graph capture** | speedup |
+| box pile | boxes | baseline | + graph capture | **+ GPU LBVH** |
 |---|--:|--:|--:|--:|
-| 3×3×3 | 27 | 5.46 ms | **1.34 ms (745 Hz)** | 4.1× |
-| 5×4×5 | 100 | 5.73 ms | **1.56 ms (640 Hz)** | 3.7× |
-| 8×6×8 | 384 | 7.00 ms | **2.50 ms (399 Hz)** | 2.8× |
-| 12×10×12 | 1440 | — | **5.10 ms (196 Hz)** | — |
+| 3×3×3 | 27 | 5.46 ms | 1.34 ms (745 Hz) | **1.33 ms (753 Hz)** |
+| 5×4×5 | 100 | 5.73 ms | 1.56 ms (640 Hz) | **1.38 ms (726 Hz)** |
+| 8×6×8 | 384 | 7.00 ms | 2.50 ms (399 Hz) | **1.46 ms (683 Hz)** |
+| 12×10×12 | 1440 | — | 5.10 ms (196 Hz) | **1.94 ms (516 Hz)** |
 
 Profiling drove the order of attack (see `benchmark.py --profile`):
 
 1. The flat ~5.5 ms floor at small N was **launch overhead** — 3.4 ms of 5.7 ms
    at 100 boxes was pure CPU dispatch for ~150 kernels/frame. **CUDA-graph
    capture** (fixed launch dims via a device-side pair count) removed it.
-2. The next bottleneck became the **host broad phase**; the dict-loop grid was
-   replaced with a fully-vectorised sort + `searchsorted` cell hash (~6×), and
-   the bounding-sphere test with a tight **world-AABB** overlap (it dropped the
-   384-box candidate set from 3662 phantom pairs to the 320 real contacts).
+2. The next bottleneck became the **host broad phase**: the spatial-hash grid had
+   to copy every body's position to the CPU, sort/`searchsorted` in NumPy, then
+   copy candidate pairs back — a hard sync every frame that dominated at scale.
+   Replacing it with a **GPU LBVH** (`wp.Bvh(..., constructor='lbvh')`, rebuilt
+   each step; per-body world AABBs and candidate-pair emission run entirely in
+   kernels via an atomic counter) keeps the whole step on-device. At 384 boxes
+   that is **2.1× faster** (683 vs 317 Hz), and at 1440 boxes **2.6×** (516 vs
+   196 Hz) — the host transfer was the wall, and it scales with N, so the bigger
+   the pile the larger the win. (`broadphase="grid"` keeps the legacy path for
+   A/B comparison; `benchmark.py` prints both.)
 3. What remains is genuinely **per-body GPU compute** (the contact + integrate
-   kernels) plus the O(N) host broad phase — both well-balanced, so further
-   micro-opts are noise. A fully-GPU broad phase (LBVH) is the next large lever
-   for piles beyond a few thousand boxes.
+   kernels) plus the LBVH build/query — both well-balanced. The AABBs are
+   inflated per-body by the manifold margin plus that body's swept motion this
+   frame, so the broad phase stays conservative (no mid-frame tunneling) without
+   the global velocity term that used to over-inflate every cell during settling.
 
 The math is unchanged throughout — these are pure implementation optimizations.
 
@@ -182,20 +219,22 @@ The math is unchanged throughout — these are pure implementation optimizations
 src/xpbd3d/
 ├── solver.py        # Solver (3-DOF): scene, substep loop, vectorised grid broad phase
 ├── kernels.py       # 3-DOF Warp kernels: integrate, GS + Jacobi solves, friction
-├── solver_6dof.py   # Solver6DOF: rigid-box scene, AABB broad phase, CUDA-graph step
-├── kernels_6dof.py  # 6-DOF kernels: integrate, OBB SAT manifold, contact + velocity solve
+├── solver_6dof.py   # Solver6DOF: rigid + particle + joint scene, LBVH broad phase, CUDA-graph step
+├── kernels_6dof.py  # 6-DOF kernels: integrate, OBB SAT manifold, contacts, joints, velocity solve
+├── kernels_bvh.py   # GPU LBVH broad phase: per-body AABB + candidate-pair emission
 ├── coloring.py      # greedy constraint-graph coloring (3-DOF GS mode)
 └── scene.py         # Body / Shape / ConstraintHandle handles
 examples/
 ├── viewer.py        # 3-DOF viser viewer (chain / cloth / stack)
-├── viewer_6dof.py   # 6-DOF viser viewer (stack / dominoes / stress / mega)
+├── viewer_6dof.py   # 6-DOF viser viewer (stack / dominoes / domino_stress / unified / stress / mega)
 ├── cloth_drop.py    # headless cloth drape (--plot saves a 3D snapshot)
 ├── hanging_chain.py # headless chain (--plot saves a PNG)
 ├── smoke_test.py    # single-particle free fall sanity
-└── benchmark.py     # device timing sweep (3-DOF + 6-DOF) + per-kernel profiler
+└── benchmark.py     # device timing sweep (3-DOF + 6-DOF + LBVH-vs-grid + unified) + profiler
 tests/
 ├── test_solver.py       # 14 tests (incl. compliance-iteration-independence, Fig. 2)
-└── test_solver_6dof.py  # 8 tests (free fall, floor rest, spin, stack, pile, tip, dominoes)
+└── test_solver_6dof.py  # 13 tests (free fall, floor rest, spin, stack, pile, tip, dominoes,
+                         #           LBVH==grid, joints, particles, cloth, unified)
 reference/
 ├── XPBD_Macklin2016.pdf            # the 3-DOF / compliant-constraint paper
 └── Mueller2020_RigidBodyXPBD.pdf   # the 6-DOF rigid-body paper
@@ -204,11 +243,11 @@ reference/
 ## Notes & sharp edges
 
 - **Velocity-aware contact margin.** Contacts are rebuilt once per frame but
-  solved across all substeps, so the broad phase pads the trigger radius by one
-  frame of relative motion (capped at one body radius) — otherwise a body
-  crosses the contact threshold mid-frame, penetrates freely and gets an
-  explosive separation impulse next frame. This is the Müller 2020 §3.4 fix and
-  is what makes the stacks settle to *zero* penetration.
+  solved across all substeps, so the broad phase pads each body's AABB by one
+  frame of its own swept motion (`dt·(|v| + |ω|·r)`) plus the manifold margin —
+  otherwise a body crosses the contact threshold mid-frame, penetrates freely and
+  gets an explosive separation impulse next frame. This is the Müller 2020 §3.4
+  fix and is what makes the stacks settle to *zero* penetration.
 - **Friction is position-based** (Müller 2020 §3.5), a square-region Coulomb
   cone limiting the per-substep tangential slide to `μ·d`. No restitution pass,
   so contacts are near-inelastic (correct for settling piles).

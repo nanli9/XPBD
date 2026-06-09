@@ -430,6 +430,59 @@ def solve_box_manifold(
                               inv_I[inc], inv_I[ref], r_inc, r_ref, p)
 
 
+# -----------------------------------------------------------------------------
+# Joints: compliant XPBD distance/attachment constraint between local anchor
+# points on any two bodies (Macklin 2016 Eq. 18; Müller 2020 §3.3 positional
+# constraint). Covers cloth edges (anchors at body centres, particles with
+# inv_I=0), rigid-rigid links and pin-to-rigid attachments (rest=0). Fixed
+# topology → solved inside the captured graph alongside contacts.
+# -----------------------------------------------------------------------------
+@wp.kernel
+def solve_joints(
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    inv_mass: wp.array(dtype=float),
+    inv_I: wp.array(dtype=wp.vec3),
+    j_a: wp.array(dtype=int),
+    j_b: wp.array(dtype=int),
+    j_anchor_a: wp.array(dtype=wp.vec3),   # anchor in A's body frame
+    j_anchor_b: wp.array(dtype=wp.vec3),   # anchor in B's body frame
+    j_rest: wp.array(dtype=float),
+    j_compliance: wp.array(dtype=float),
+    lam_joint: wp.array(dtype=float),      # one λ per joint (reset per substep)
+    h: float,
+    dx: wp.array(dtype=wp.vec3),
+    drot: wp.array(dtype=wp.vec3),
+    dcount: wp.array(dtype=int),
+):
+    k = wp.tid()
+    a = j_a[k]
+    b = j_b[k]
+    pa = x[a] + wp.quat_rotate(q[a], j_anchor_a[k])
+    pb = x[b] + wp.quat_rotate(q[b], j_anchor_b[k])
+    d = pa - pb
+    dist = wp.length(d)
+    if dist < EPS:
+        return
+    n = d / dist
+    C = dist - j_rest[k]                   # >0 stretched, <0 compressed
+    ra = pa - x[a]
+    rb = pb - x[b]
+    w_a = gen_inv_mass(inv_mass[a], q[a], inv_I[a], ra, n)
+    w_b = gen_inv_mass(inv_mass[b], q[b], inv_I[b], rb, n)
+    wsum = w_a + w_b
+    if wsum <= 0.0:
+        return
+    # compliant XPBD update: Δλ = (−C − α̃ λ)/(w + α̃), α̃ = compliance/h²
+    alpha = j_compliance[k] / (h * h)
+    dlam = (-C - alpha * lam_joint[k]) / (wsum + alpha)
+    lam_joint[k] = lam_joint[k] + dlam
+    p = dlam * n
+    accumulate_correction(dx, drot, dcount, a, b,
+                          inv_mass[a], inv_mass[b], q[a], q[b],
+                          inv_I[a], inv_I[b], ra, rb, p)
+
+
 @wp.kernel
 def apply_jacobi_6dof(
     x: wp.array(dtype=wp.vec3),

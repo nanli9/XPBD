@@ -3,10 +3,13 @@
 The 6-DOF counterpart of ``viewer.py``: real rigid **boxes** with quaternion
 orientation, rotated inertia and OBB contacts (Müller et al. 2020), running on
 the GPU with a CUDA-graph-captured substep loop. Mirrors the AVBD ``Solver6DOF``
-viewer — stacks, dominoes, and big block piles you can watch settle.
+viewer — stacks, dominoes, big block piles, and a unified rigid+cloth+joints
+scene.
 
     uv run python examples/viewer_6dof.py --scene stack
     uv run python examples/viewer_6dof.py --scene dominoes
+    uv run python examples/viewer_6dof.py --scene domino_stress   # many cascading chains
+    uv run python examples/viewer_6dof.py --scene unified         # rigid bodies + cloth + joints
     uv run python examples/viewer_6dof.py --stress      # 384-box pile
     uv run python examples/viewer_6dof.py --mega        # 1440-box pile
     # open http://localhost:8080
@@ -95,17 +98,137 @@ def build_pile(args, nx, ny, nz):
     return s
 
 
+def build_domino_stress(args):
+    """Many parallel domino chains, each kicked off at one end, all cascading at
+    once — a broad-phase / contact stress test."""
+    s = _solver(args)
+    s.friction = max(s.friction, 0.6)
+    import warp as wp
+    hw, hh, hd = 0.03, 0.22, 0.10
+    sp = 0.17
+    nc = args.n_chains
+    per = args.per_chain
+    gap = 0.6                                   # spacing between chains (z)
+    lean = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), -0.5)
+    for c in range(nc):
+        z = (c - nc / 2) * gap
+        base = (0.25, 0.55, 0.9) if c % 2 == 0 else (0.95, 0.6, 0.2)
+        for k in range(per):
+            tip = k == 0
+            q = (lean[0], lean[1], lean[2], lean[3]) if tip else (0.0, 0.0, 0.0, 1.0)
+            y = hh * 0.88 if tip else hh
+            t = k / max(per - 1, 1)
+            col = (base[0] * (0.5 + 0.5 * t), base[1], base[2] * (0.5 + 0.5 * (1 - t)))
+            s.add_box((k * sp - per * sp / 2, y, z), (hw, hh, hd), mass=1.0,
+                      quaternion=q, color=col)
+    return s, []
+
+
+def _grid_faces(R):
+    """Two (double-sided) triangles per cell of an R×R particle grid."""
+    f = []
+    for iy in range(R - 1):
+        for ix in range(R - 1):
+            a = iy * R + ix; b = iy * R + ix + 1
+            c = (iy + 1) * R + ix; d = (iy + 1) * R + ix + 1
+            f.append([a, c, b]); f.append([b, c, d])
+    f = np.asarray(f, np.uint32)
+    return np.vstack([f, f[:, ::-1]])           # both windings → visible from both sides
+
+
+def build_unified(args):
+    """One scene with all three constraint types coupled in a single substep
+    loop / captured graph: rigid bodies (a block pile + a swinging bar), a
+    **cloth** curtain (particles + compliant distance joints) hung from the bar,
+    and an **articulated** rigid pendulum (boxes linked by rigid joints)."""
+    s = _solver(args)
+    s.friction = max(s.friction, 0.5)
+    s.iterations = max(s.iterations, 2)         # joints converge better with ≥2
+    import warp as wp
+    cloth_meshes = []
+    post_col = (0.42, 0.42, 0.48)
+
+    # --- clothesline: a dynamic bar held between two static posts by joints ---
+    W = 1.6
+    barhalf = W / 2.0 + 0.06
+    z0 = -0.7
+    ypost = 1.9
+    ytop = ypost + 0.5                          # post top / bar height
+    post_l = s.add_box((-barhalf - 0.1, ypost, z0), (0.06, 0.5, 0.06), mass=0.0,
+                       static=True, color=post_col)
+    post_r = s.add_box((barhalf + 0.1, ypost, z0), (0.06, 0.5, 0.06), mass=0.0,
+                       static=True, color=post_col)
+    bar = s.add_box((0.0, ytop, z0), (barhalf, 0.04, 0.04), mass=2.0, color=(0.55, 0.4, 0.3))
+    s.add_joint(bar, post_l, compliance=0.0, anchor_a=(-barhalf, 0.0, 0.0), anchor_b=(0.0, 0.5, 0.0))
+    s.add_joint(bar, post_r, compliance=0.0, anchor_a=(barhalf, 0.0, 0.0), anchor_b=(0.0, 0.5, 0.0))
+
+    # --- cloth curtain hung from the bar ---
+    R = args.cloth_res
+    sp = W / (R - 1)
+    ctop = ytop - 0.05
+    idx = np.empty((R, R), np.int64)
+    for iy in range(R):
+        for ix in range(R):
+            px = -W / 2.0 + ix * sp
+            py = ctop - iy * sp
+            b = s.add_particle((px, py, z0), mass=0.02, radius=0.012, group=1,
+                               color=(0.85, 0.22, 0.30))
+            idx[iy, ix] = b.index
+    for iy in range(R):
+        for ix in range(R):
+            if ix + 1 < R:
+                s.add_joint(int(idx[iy, ix]), int(idx[iy, ix + 1]), compliance=1e-7)
+            if iy + 1 < R:
+                s.add_joint(int(idx[iy, ix]), int(idx[iy + 1, ix]), compliance=1e-7)
+            if ix + 1 < R and iy + 1 < R:       # shear (both diagonals)
+                s.add_joint(int(idx[iy, ix]), int(idx[iy + 1, ix + 1]), compliance=2e-7)
+                s.add_joint(int(idx[iy + 1, ix]), int(idx[iy, ix + 1]), compliance=2e-7)
+    for ix in range(R):                         # pin top row to the (movable) bar
+        px = -W / 2.0 + ix * sp
+        s.add_joint(int(idx[0, ix]), bar, compliance=0.0, anchor_b=(px, -0.04, 0.0))
+    cloth_meshes.append({"idx": idx, "faces": _grid_faces(R), "color": (0.85, 0.22, 0.30)})
+
+    # --- articulated rigid pendulum: boxes linked by rigid joints ---
+    link = 0.30
+    hx, hz = 2.4, 0.7
+    hook = s.add_box((hx, ytop, hz), (0.05, 0.05, 0.05), mass=0.0, static=True, color=post_col)
+    prev = hook
+    for k in range(4):
+        lk = s.add_box((hx + (k + 0.5) * link + link * 0.5 * k, ytop, hz),
+                       (link * 0.45, 0.05, 0.05), mass=0.6, color=(0.2, 0.7 - 0.1 * k, 0.85))
+        a_anchor = (0.0, 0.0, 0.0) if k == 0 else (link * 0.45, 0.0, 0.0)
+        s.add_joint(prev, lk, compliance=0.0, anchor_a=a_anchor, anchor_b=(-link * 0.45, 0.0, 0.0))
+        prev = lk
+
+    # --- a small rigid block pile for the cloth/boxes to interact with ---
+    rng = np.random.default_rng(0)
+    hb = 0.16
+    for ly in range(3):
+        for ix in range(3):
+            s.add_box((-2.1 + ix * 0.36 + rng.uniform(-1e-3, 1e-3), hb + ly * 0.34,
+                       1.0 + rng.uniform(-1e-3, 1e-3)),
+                      (hb, hb, hb), mass=1.0,
+                      color=(0.3 + 0.5 * rng.random(), 0.5, 0.85))
+    return s, cloth_meshes
+
+
 def build_scene(args):
+    """Returns ``(solver, cloth_meshes)`` — ``cloth_meshes`` is a list of
+    ``{idx, faces, color}`` describing particle grids to render as sheets."""
     if args.scene == "stack":
-        return build_stack(args)
+        return build_stack(args), []
     if args.scene == "dominoes":
-        return build_dominoes(args)
+        return build_dominoes(args), []
+    if args.scene == "domino_stress":
+        return build_domino_stress(args)
+    if args.scene == "unified":
+        return build_unified(args)
     if args.scene == "pile":
-        return build_pile(args, 4, 4, 4)
+        return build_pile(args, 4, 4, 4), []
     if args.scene == "stress":
-        return build_pile(args, 8, 6, 8)
+        return build_pile(args, 8, 6, 8), []
     if args.scene == "mega":
-        return build_pile(args, 12, 10, 12)
+        return build_pile(args, 12, 10, 12), []
     raise ValueError(args.scene)
 
 
@@ -121,7 +244,7 @@ class Viewer:
             self.server.scene.set_up_direction("+y")
         except Exception:
             pass
-        self.solver = build_scene(args)
+        self.solver, self._cloth_meshes = build_scene(args)
         self.solver._flush()
 
         self.server.scene.add_box("/ground", dimensions=(12.0, 0.04, 12.0),
@@ -133,26 +256,43 @@ class Viewer:
 
         self._boxes_node = None
         self._build_boxes()
+        self._build_cloths()
         self._build_gui()
         self._frame = 0
         self._step_ms = []
 
     def _build_boxes(self):
+        """Instanced cubes for the rigid (non-particle) bodies only; cloth nodes
+        are drawn as sheets by ``_build_cloths``."""
         if self._boxes_node is not None:
             try:
                 self._boxes_node.remove()
             except Exception:
                 pass
         s = self.solver
-        n = s.num_bodies
         he = np.asarray(s._he, np.float32).reshape(-1, 3)
-        scales = (2.0 * he).astype(np.float32)
-        colors = np.array([_u8(b.color) for b in s.bodies], np.uint8)
-        pos = s.positions().astype(np.float32)
-        wxyz = s.orientations()[:, [3, 0, 1, 2]].astype(np.float32)
+        self._rigid_idx = np.array([b.index for b in s.bodies if not b.is_particle], np.int64)
+        if len(self._rigid_idx) == 0:
+            self._boxes_node = None
+            return
+        ri = self._rigid_idx
+        scales = (2.0 * he[ri]).astype(np.float32)
+        colors = np.array([_u8(s.bodies[i].color) for i in ri], np.uint8)
+        pos = s.positions()[ri].astype(np.float32)
+        wxyz = s.orientations()[ri][:, [3, 0, 1, 2]].astype(np.float32)
         self._boxes_node = self.server.scene.add_batched_meshes_simple(
             "/boxes", _CUBE_V, _CUBE_F, batched_positions=pos, batched_wxyzs=wxyz,
             batched_scales=scales, batched_colors=colors, flat_shading=True)
+
+    def _build_cloths(self):
+        """(Re)create each cloth sheet mesh from current particle positions.
+        viser meshes have no vertex setter, so we replace the node by name."""
+        P = self.solver.positions()
+        for k, cm in enumerate(self._cloth_meshes):
+            verts = P[cm["idx"].reshape(-1)].astype(np.float32)
+            self.server.scene.add_mesh_simple(
+                f"/cloth{k}", vertices=verts, faces=cm["faces"],
+                color=_u8(cm["color"]), flat_shading=False, side="double")
 
     def _build_gui(self):
         a = self.args
@@ -173,7 +313,7 @@ class Viewer:
             self.g_push.on_click(lambda _: self._push())
         with self.server.gui.add_folder("Performance"):
             self.p_device = self.server.gui.add_text("device", self.solver.device)
-            self.p_bodies = self.server.gui.add_text("boxes", str(self.solver.num_bodies))
+            self.p_bodies = self.server.gui.add_text("bodies", str(self.solver.num_bodies))
             self.p_pairs = self.server.gui.add_text("contact pairs", "—")
             self.p_step = self.server.gui.add_text("step time", "—")
             self.p_cap = self.server.gui.add_text("solver capacity", "—")
@@ -191,7 +331,7 @@ class Viewer:
 
     def _reset(self):
         with self._lock:
-            self.solver = build_scene(self.args)
+            self.solver, self._cloth_meshes = build_scene(self.args)
             self.solver.substeps = int(self.g_substeps.value)
             self.solver.iterations = int(self.g_iters.value)
             self.solver.gravity = (0.0, float(self.g_gravity.value), 0.0)
@@ -199,6 +339,7 @@ class Viewer:
             self.solver.restitution = float(self.g_rest.value)
             self.solver._flush()
             self._build_boxes()
+            self._build_cloths()
             self._frame = 0
 
     def _drop(self):
@@ -232,10 +373,15 @@ class Viewer:
             node = self._boxes_node
             n_pairs = self.solver.n_pairs
         dt = time.perf_counter() - t0
-        if node is not None and len(pos) == node.batched_positions.shape[0]:
-            with self.server.atomic():
-                node.batched_positions = pos
-                node.batched_wxyzs = wxyz
+        ri = self._rigid_idx
+        with self.server.atomic():
+            if node is not None and len(ri) == node.batched_positions.shape[0]:
+                node.batched_positions = pos[ri]
+                node.batched_wxyzs = wxyz[ri]
+            for k, cm in enumerate(self._cloth_meshes):
+                self.server.scene.add_mesh_simple(
+                    f"/cloth{k}", vertices=pos[cm["idx"].reshape(-1)], faces=cm["faces"],
+                    color=_u8(cm["color"]), flat_shading=False, side="double")
         self._frame += 1
         self._step_ms.append(dt * 1000.0)
         self._step_ms = self._step_ms[-30:]
@@ -262,7 +408,8 @@ class Viewer:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--scene", choices=["stack", "dominoes", "pile", "stress", "mega"],
+    p.add_argument("--scene", choices=["stack", "dominoes", "domino_stress",
+                                       "unified", "pile", "stress", "mega"],
                    default="pile")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--substeps", type=int, default=15)
@@ -272,6 +419,9 @@ def main():
     p.add_argument("--restitution", type=float, default=0.0)
     p.add_argument("--stack-height", type=int, default=6)
     p.add_argument("--n-dominoes", type=int, default=8)
+    p.add_argument("--n-chains", type=int, default=8, help="domino_stress: parallel chains")
+    p.add_argument("--per-chain", type=int, default=22, help="domino_stress: dominoes per chain")
+    p.add_argument("--cloth-res", type=int, default=20, help="unified: cloth grid resolution")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--stress", action="store_true", help="384-box pile (8x6x8)")
     p.add_argument("--mega", action="store_true", help="1440-box pile (12x10x12)")

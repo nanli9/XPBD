@@ -20,9 +20,9 @@ import warp as wp
 from xpbd3d import Body, Solver, Solver6DOF, Shape
 
 
-def make_box_pile(nx, ny, nz, device, substeps, iterations):
+def make_box_pile(nx, ny, nz, device, substeps, iterations, broadphase="lbvh"):
     s = Solver6DOF(dt=1 / 60, substeps=substeps, iterations=iterations,
-                   device=device, floor_y=0.0, friction=0.6)
+                   device=device, floor_y=0.0, friction=0.6, broadphase=broadphase)
     h = 0.16
     rng = np.random.default_rng(0)
     sp = 2.25 * h
@@ -31,6 +31,40 @@ def make_box_pile(nx, ny, nz, device, substeps, iterations):
             for iz in range(nz):
                 s.add_box((ix * sp + rng.uniform(-1e-3, 1e-3), h + ly * sp,
                            iz * sp + rng.uniform(-1e-3, 1e-3)), (h, h, h), mass=1.0)
+    return s
+
+
+def make_unified(cloth_res, device, substeps, iterations):
+    """Rigid block pile + a cloth curtain (particles + distance joints) hung from
+    a static bar — exercises all three constraint types in one captured graph."""
+    s = Solver6DOF(dt=1 / 60, substeps=substeps, iterations=max(iterations, 2),
+                   device=device, floor_y=0.0, friction=0.6, broadphase="lbvh")
+    h = 0.16
+    rng = np.random.default_rng(0)
+    sp = 2.25 * h
+    for ly in range(3):                              # 3×3×3 rigid pile
+        for ix in range(3):
+            for iz in range(3):
+                s.add_box((ix * sp + rng.uniform(-1e-3, 1e-3), h + ly * sp,
+                           iz * sp - 2.0 + rng.uniform(-1e-3, 1e-3)), (h, h, h), mass=1.0)
+    R = cloth_res
+    cs = 1.6 / (R - 1)
+    idx = np.empty((R, R), np.int64)
+    for iy in range(R):
+        for ix in range(R):
+            pinned = iy == 0
+            b = s.add_particle((ix * cs - 0.8, 2.4 - iy * cs, 0.0),
+                               mass=0.0 if pinned else 0.02, radius=0.012,
+                               group=1, static=pinned)
+            idx[iy, ix] = b.index
+    for iy in range(R):
+        for ix in range(R):
+            if ix + 1 < R:
+                s.add_joint(int(idx[iy, ix]), int(idx[iy, ix + 1]), compliance=1e-7)
+            if iy + 1 < R:
+                s.add_joint(int(idx[iy, ix]), int(idx[iy + 1, ix]), compliance=1e-7)
+            if ix + 1 < R and iy + 1 < R:
+                s.add_joint(int(idx[iy, ix]), int(idx[iy + 1, ix + 1]), compliance=2e-7)
     return s
 
 
@@ -135,6 +169,27 @@ def main():
             ms = time_steps(s, frames=args.frames)
             print(f"  {'box pile %dx%dx%d' % (nx, ny, nz):28s} boxes={s.num_bodies:5d} "
                   f"pairs={s.n_pairs:5d} | {ms:7.2f} ms/step | {1000/ms:6.1f} Hz")
+
+        # Broad-phase A/B: GPU LBVH (all-device) vs the NumPy spatial-hash grid
+        # (which round-trips positions to the host each step).
+        print("-- broad phase: GPU LBVH vs NumPy grid (box pile 8x6x8) --")
+        for bp in ("lbvh", "grid"):
+            s = make_box_pile(8, 6, 8, dev, args.substeps, args.iterations, broadphase=bp)
+            for _ in range(30):
+                s.step()
+            ms = time_steps(s, frames=args.frames)
+            print(f"  {('broadphase=%s' % bp):28s} boxes={s.num_bodies:5d} "
+                  f"pairs={s.n_pairs:5d} | {ms:7.2f} ms/step | {1000/ms:6.1f} Hz")
+
+        # Unified: rigid bodies + cloth (particles + joints) in one graph.
+        print("-- 6-DOF unified rigid + cloth + joints --")
+        for R in ((16, 24) if str(dev).startswith("cuda") else (12,)):
+            s = make_unified(R, dev, args.substeps, args.iterations)
+            for _ in range(30):
+                s.step()
+            ms = time_steps(s, frames=args.frames)
+            print(f"  {'unified cloth %dx%d' % (R, R):28s} bodies={s.num_bodies:5d} "
+                  f"joints={s.num_joints:5d} pairs={s.n_pairs:5d} | {ms:7.2f} ms/step | {1000/ms:6.1f} Hz")
 
     if args.profile and any(str(d).startswith("cuda") for d in devices):
         print("\n=== per-kernel CUDA activity (cloth 48x48, jacobi) ===")

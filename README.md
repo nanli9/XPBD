@@ -145,7 +145,7 @@ velocity pass for dynamic friction + restitution.
 | velocity pass: friction Eq. 30 + restitution (§3.6) | `velocity_box`, `velocity_floor` |
 | static friction at position level (§3.5) | in `solve_floor_contacts` |
 | compliant joint `Δλ = (−C − α̃λ)/(w_a+w_b+α̃)` between local anchors (§3.3) | `solve_joints` |
-| GPU LBVH broad phase (per-body AABB + tree query) | `kernels_bvh` (`compute_body_aabb`, `emit_pairs`) |
+| GPU broad phase — LBVH tree / spatial hash / host grid | `kernels_bvh`, `kernels_hashgrid`, `solver._grid_candidate_pairs` |
 
 Contacts use the paper's **Jacobi** projection (atomic accumulate + averaged
 apply) — no graph coloring. Box-box collisions use a face-axis SAT normal with a
@@ -183,12 +183,12 @@ Two optimizations stack: **CUDA-graph capture** of the fixed substep-loop kernel
 sequence (~150 launches/frame collapse to one graph replay), then an all-device
 **GPU LBVH** broad phase that removes the per-step host round-trip.
 
-| box pile | boxes | baseline | + graph capture | **+ GPU LBVH** |
+| box pile | boxes | baseline | + graph capture (grid) | **+ GPU LBVH** |
 |---|--:|--:|--:|--:|
 | 3×3×3 | 27 | 5.46 ms | 1.34 ms (745 Hz) | **1.33 ms (753 Hz)** |
 | 5×4×5 | 100 | 5.73 ms | 1.56 ms (640 Hz) | **1.38 ms (726 Hz)** |
-| 8×6×8 | 384 | 7.00 ms | 2.50 ms (399 Hz) | **1.46 ms (683 Hz)** |
-| 12×10×12 | 1440 | — | 5.10 ms (196 Hz) | **1.94 ms (516 Hz)** |
+| 8×6×8 | 384 | 7.00 ms | 3.22 ms (310 Hz) | **1.41 ms (707 Hz)** |
+| 12×10×12 | 1440 | — | 6.23 ms (161 Hz) | **1.84 ms (542 Hz)** |
 
 Profiling drove the order of attack (see `benchmark.py --profile`):
 
@@ -198,13 +198,30 @@ Profiling drove the order of attack (see `benchmark.py --profile`):
 2. The next bottleneck became the **host broad phase**: the spatial-hash grid had
    to copy every body's position to the CPU, sort/`searchsorted` in NumPy, then
    copy candidate pairs back — a hard sync every frame that dominated at scale.
-   Replacing it with a **GPU LBVH** (`wp.Bvh(..., constructor='lbvh')`, rebuilt
-   each step; per-body world AABBs and candidate-pair emission run entirely in
-   kernels via an atomic counter) keeps the whole step on-device. At 384 boxes
-   that is **2.1× faster** (683 vs 317 Hz), and at 1440 boxes **2.6×** (516 vs
-   196 Hz) — the host transfer was the wall, and it scales with N, so the bigger
-   the pile the larger the win. (`broadphase="grid"` keeps the legacy path for
-   A/B comparison; `benchmark.py` prints both.)
+   To attribute the cost cleanly there are **three** broad phases (all
+   conservative AABB filters, identical candidate sets, selectable via
+   `broadphase=`), which separate the two confounded variables — *where* it runs
+   and *what* data structure it is:
+
+   | 1440 boxes | structure | runs on | ms/step | Hz |
+   |---|---|---|--:|--:|
+   | `grid` | uniform hash | **CPU** (NumPy) | 6.23 | 161 |
+   | `hashgrid` | uniform hash | **GPU** (`wp.HashGrid`) | 3.84 | 261 |
+   | `lbvh` | **tree** (LBVH) | **GPU** (`wp.Bvh`) | 1.84 | **542** |
+
+   - `grid → hashgrid` (same algorithm, CPU→GPU) is **1.6×** — that is the pure
+     cost of the host round-trip, and it scales with N.
+   - `hashgrid → lbvh` (same device, grid→tree) is another **2.1×** — and the
+     LBVH wins *despite emitting ~5× more candidate pairs*, because a tree
+     descent prunes whole subtrees and uses tight per-body AABBs, whereas a
+     uniform grid must walk a coarse 3×3×3 sphere-cell neighbourhood (the box
+     diagonal forces large cells) and filter most of it away. The extra
+     candidates the LBVH passes through are cheap — the narrow-phase SAT
+     early-outs on non-overlap.
+
+   The LBVH (`wp.Bvh(..., constructor='lbvh')`, rebuilt each step; per-body world
+   AABBs and atomic-counter pair emission all in kernels) is the default; the
+   other two are kept for this A/B (printed by `benchmark.py`).
 3. What remains is genuinely **per-body GPU compute** (the contact + integrate
    kernels) plus the LBVH build/query — both well-balanced. The AABBs are
    inflated per-body by the manifold margin plus that body's swept motion this
@@ -222,6 +239,7 @@ src/xpbd3d/
 ├── solver_6dof.py   # Solver6DOF: rigid + particle + joint scene, LBVH broad phase, CUDA-graph step
 ├── kernels_6dof.py  # 6-DOF kernels: integrate, OBB SAT manifold, contacts, joints, velocity solve
 ├── kernels_bvh.py   # GPU LBVH broad phase: per-body AABB + candidate-pair emission
+├── kernels_hashgrid.py # GPU spatial-hash broad phase (wp.HashGrid) — the grid/tree A/B
 ├── coloring.py      # greedy constraint-graph coloring (3-DOF GS mode)
 └── scene.py         # Body / Shape / ConstraintHandle handles
 examples/

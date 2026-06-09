@@ -18,7 +18,10 @@ Müller 2020 §3.3.
 
 Broad phase is a GPU **LBVH** (``kernels_bvh``): per-body world AABBs are built
 and queried entirely on device, emitting candidate pairs with an atomic counter —
-no host round-trip. (``broadphase="grid"`` keeps the legacy NumPy spatial hash.)
+no host round-trip. Two alternatives select via ``broadphase=``: ``"hashgrid"``
+(a GPU spatial hash on ``wp.HashGrid``, ``kernels_hashgrid``) and ``"grid"`` (the
+legacy NumPy spatial hash on the host) — all three give identical candidate sets,
+kept for an apples-to-apples broad-phase comparison (see ``benchmark.py``).
 
 Mirrors the AVBD ``Solver6DOF`` role: the same kind of scene (stacks, dominoes,
 cloth) runs on CUDA with live viewer knobs.
@@ -33,6 +36,7 @@ import warp as wp
 
 from . import kernels_6dof as K6
 from . import kernels_bvh as KB
+from . import kernels_hashgrid as KH
 from .solver import _grid_candidate_pairs
 
 
@@ -153,6 +157,10 @@ class Solver6DOF:
         self.n_joints = 0
         # GPU LBVH broad phase
         self.lowers = self.uppers = self.bvh = None
+        # GPU spatial-hash broad phase
+        self.hgrid = None
+        self._hg_cell = 0.0
+        self._hg_rsmax = 0.0
 
     # ---- scene building -----------------------------------------------------
     def _add_body(self, position, half_extents, mass, quaternion, velocity,
@@ -319,6 +327,16 @@ class Solver6DOF:
                       outputs=[self.lowers, self.uppers], device=dev)
             self.bvh = wp.Bvh(self.lowers, self.uppers, constructor="lbvh")
 
+        # GPU spatial hash: cell sized like the NumPy grid (2·max bounding-sphere
+        # radius + margin). he is fixed for a body's lifetime, so rs_max is a
+        # one-time host max; per-frame motion is added per body in the kernel.
+        self.hgrid = None
+        if self.broadphase == "hashgrid" and n >= 1:
+            he_arr = np.asarray(self._he, np.float32).reshape(-1, 3)
+            self._hg_rsmax = float(np.linalg.norm(he_arr, axis=1).max())
+            self._hg_cell = 2.0 * self._hg_rsmax + self._man_margin
+            self.hgrid = wp.HashGrid(128, 128, 128, device=dev)
+
         self._graph = None          # captured CUDA graph (invalidated on change)
         self._graph_sig = None
         self._dirty = False
@@ -435,6 +453,31 @@ class Solver6DOF:
             self._graph = None
         return cnt
 
+    def _broadphase_hashgrid(self, n):
+        """On-device spatial-hash broad phase (``wp.HashGrid``): bin body centres,
+        then emit candidate pairs with the same exact AABB filter as the LBVH
+        path. Returns the live pair count (one int read back for overflow)."""
+        dev = self.device
+        self.hgrid.build(self.x, self._hg_cell)
+        self.n_pairs_dev.zero_()
+        args = [self.hgrid.id, self.x, self.q, self.v, self.omega, self.he,
+                self.inv_mass, self.cgroup, self._man_margin, self.dt,
+                self._hg_rsmax, self._hg_cell]
+        wp.launch(KH.emit_pairs_hashgrid, dim=n,
+                  inputs=args + [self.cap],
+                  outputs=[self.n_pairs_dev, self.pair_a, self.pair_b], device=dev)
+        cnt = int(self.n_pairs_dev.numpy()[0])
+        if cnt > self.cap:
+            self.cap = int(cnt * 1.5)
+            self._alloc_pair_buffers(self.cap, dev)
+            self.n_pairs_dev.zero_()
+            wp.launch(KH.emit_pairs_hashgrid, dim=n,
+                      inputs=args + [self.cap],
+                      outputs=[self.n_pairs_dev, self.pair_a, self.pair_b], device=dev)
+            cnt = int(self.n_pairs_dev.numpy()[0])
+            self._graph = None
+        return cnt
+
     def _signature(self, n):
         return (n, self.cap, self.n_joints, self.substeps, self.iterations,
                 self.gyroscopic, round(self.dt, 9), self.gravity,
@@ -450,11 +493,14 @@ class Solver6DOF:
             return
         dev = self.device
         use_lbvh = self.broadphase == "lbvh" and self.bvh is not None
+        use_hashgrid = self.broadphase == "hashgrid" and self.hgrid is not None
 
         if use_lbvh:
             # all-device broad phase: pairs + count already live in the device
             # buffers the graph reads, so no host pair assignment is needed.
             self.n_pairs = self._broadphase_gpu(n)
+        elif use_hashgrid:
+            self.n_pairs = self._broadphase_hashgrid(n)
         else:
             a, b = self._rebuild_pairs()
             self.n_pairs = int(len(a))

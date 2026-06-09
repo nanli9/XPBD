@@ -105,9 +105,9 @@ def test_box_tips_and_rests_flat():
     assert np.linalg.norm(s.omega.numpy()[0]) < 0.2
 
 
-def test_lbvh_matches_grid():
-    """The GPU LBVH broad phase must produce the same settled stack as the
-    legacy NumPy spatial-hash grid (both are conservative AABB broad phases)."""
+def test_broadphases_agree():
+    """All three broad phases — NumPy grid (host), GPU hashgrid, GPU LBVH — are
+    conservative AABB filters, so they must produce the same settled stack."""
     def run(bp):
         s = Solver6DOF(dt=1 / 60, substeps=20, iterations=1, device=DEVICE,
                        floor_y=0.0, friction=0.6, broadphase=bp)
@@ -117,7 +117,9 @@ def test_lbvh_matches_grid():
         for _ in range(300):
             s.step()
         return np.sort(s.positions()[:, 1])
-    assert np.allclose(run("lbvh"), run("grid"), atol=5e-3)
+    ref = run("lbvh")
+    assert np.allclose(run("grid"), ref, atol=5e-3)
+    assert np.allclose(run("hashgrid"), ref, atol=5e-3)
 
 
 def test_joint_rigid_link():

@@ -170,16 +170,19 @@ def main():
             print(f"  {'box pile %dx%dx%d' % (nx, ny, nz):28s} boxes={s.num_bodies:5d} "
                   f"pairs={s.n_pairs:5d} | {ms:7.2f} ms/step | {1000/ms:6.1f} Hz")
 
-        # Broad-phase A/B: GPU LBVH (all-device) vs the NumPy spatial-hash grid
-        # (which round-trips positions to the host each step).
-        print("-- broad phase: GPU LBVH vs NumPy grid (box pile 8x6x8) --")
-        for bp in ("lbvh", "grid"):
-            s = make_box_pile(8, 6, 8, dev, args.substeps, args.iterations, broadphase=bp)
-            for _ in range(30):
-                s.step()
-            ms = time_steps(s, frames=args.frames)
-            print(f"  {('broadphase=%s' % bp):28s} boxes={s.num_bodies:5d} "
-                  f"pairs={s.n_pairs:5d} | {ms:7.2f} ms/step | {1000/ms:6.1f} Hz")
+        # Broad-phase 3-way: isolates the two variables (where it runs, and the
+        # data structure).  grid (CPU hash) → hashgrid (GPU hash): the host
+        # round-trip.  hashgrid (GPU hash) → lbvh (GPU tree): the data structure.
+        print("-- broad phase: NumPy grid (host) vs GPU hashgrid vs GPU LBVH --")
+        for sz in ((8, 6, 8), (12, 10, 12)):
+            for bp in ("grid", "hashgrid", "lbvh"):
+                s = make_box_pile(*sz, dev, args.substeps, args.iterations, broadphase=bp)
+                for _ in range(30):
+                    s.step()
+                ms = time_steps(s, frames=args.frames)
+                print(f"  {('%dx%dx%d  %s' % (sz[0], sz[1], sz[2], bp)):28s} "
+                      f"boxes={s.num_bodies:5d} pairs={s.n_pairs:5d} | "
+                      f"{ms:7.2f} ms/step | {1000/ms:6.1f} Hz")
 
         # Unified: rigid bodies + cloth (particles + joints) in one graph.
         print("-- 6-DOF unified rigid + cloth + joints --")

@@ -125,15 +125,16 @@ def build_domino_stress(args):
 
 
 def _grid_faces(R):
-    """Two (double-sided) triangles per cell of an R×R particle grid."""
+    """Two triangles per cell of an R×R particle grid (single winding — the mesh
+    is rendered with ``side="double"``, so duplicating reversed faces would just
+    create coincident coplanar geometry that z-fights and flickers)."""
     f = []
     for iy in range(R - 1):
         for ix in range(R - 1):
             a = iy * R + ix; b = iy * R + ix + 1
             c = (iy + 1) * R + ix; d = (iy + 1) * R + ix + 1
             f.append([a, c, b]); f.append([b, c, d])
-    f = np.asarray(f, np.uint32)
-    return np.vstack([f, f[:, ::-1]])           # both windings → visible from both sides
+    return np.asarray(f, np.uint32)
 
 
 def build_unified(args):

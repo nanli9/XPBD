@@ -347,10 +347,24 @@ class Viewer:
         with self._lock:
             import warp as wp
             rng = np.random.default_rng()
+            he = np.array([0.2, 0.14, 0.2], np.float32)
+            x = float(rng.uniform(-1, 1)); z = float(rng.uniform(-1, 1))
+            # Spawn clear of every existing body: sit above the tallest body whose
+            # xz-footprint overlaps the new box. Rapid clicks then *stack* instead
+            # of spawning two boxes interpenetrating at y=3 — an overlapping spawn
+            # is resolved as a single-substep depenetration and rockets both bodies
+            # off-screen at the velocity cap.
+            P = self.solver.positions()
+            HE = np.asarray(self.solver._he, np.float32).reshape(-1, 3)
+            y = 3.0
+            if len(P):
+                near = ((np.abs(P[:, 0] - x) < HE[:, 0] + he[0] + 0.05) &
+                        (np.abs(P[:, 2] - z) < HE[:, 2] + he[2] + 0.05))
+                if near.any():
+                    y = max(y, float((P[near, 1] + HE[near, 1]).max()) + he[1] + 0.15)
             ax = wp.normalize(wp.vec3(float(rng.uniform(-1, 1)), 1.0, float(rng.uniform(-1, 1))))
             qq = wp.quat_from_axis_angle(ax, float(rng.uniform(0, 1.0)))
-            self.solver.add_box((float(rng.uniform(-1, 1)), 3.0, float(rng.uniform(-1, 1))),
-                                (0.2, 0.14, 0.2), mass=1.5,
+            self.solver.add_box((x, y, z), tuple(float(v) for v in he), mass=1.5,
                                 quaternion=(qq[0], qq[1], qq[2], qq[3]),
                                 color=(0.2, 0.85, 0.85))
             self.solver._flush()

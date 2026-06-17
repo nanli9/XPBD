@@ -251,6 +251,13 @@ stand on the grid. Drag the per-joint sliders to pose the legs (live FK), toggle
 inheritance + `childclass`, `<include>`, and `meshdir`; the URDF loader resolves
 `package://` mesh paths.
 
+A **Model** dropdown switches between *every* URDF/MJCF robot found in the
+sibling description repos — `xpbd3d.robot.registry.discover_models()` globs and
+validates them (go2/b2/a2/go2w quadrupeds, the g1/h1 humanoids, … 50+ models);
+the per-joint sliders rebuild for the chosen model and `--format`/`--robot` just
+set the initial pick. The same dropdown is in the physics demo below (it
+hot-swaps the live simulation).
+
 ### XPBD physics on the robot (`examples/sim_robot_xpbd.py`)
 
 ```

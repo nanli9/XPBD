@@ -122,6 +122,23 @@ class RobotView:
                 fr.position = pos
                 fr.wxyz = wxyz
 
+    def remove(self):
+        """Remove every scene node this view created (meshes then link frames),
+        so a viewer can swap to a different model without leaking nodes."""
+        for h in self._visual_nodes + self._collision_nodes:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        for fr in self._frames.values():
+            try:
+                fr.remove()
+            except Exception:
+                pass
+        self._visual_nodes.clear()
+        self._collision_nodes.clear()
+        self._frames.clear()
+
     def set_visual_visible(self, on: bool):
         for h in self._visual_nodes:
             h.visible = bool(on)

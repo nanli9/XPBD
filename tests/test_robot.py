@@ -131,6 +131,22 @@ def test_self_collision_excludes_only_adjacent():
     assert set(off.solver._group) == {7}         # falls back to single-group filter
 
 
+@pytest.mark.skipif(not _have_mjcf, reason="go2 MJCF not present")
+def test_registry_discovers_models():
+    """Model discovery finds loadable robots with unique labels, and go2 (the
+    model both viewers default to) is among them."""
+    from xpbd3d.robot.registry import discover_models, entry_for_path
+
+    models = discover_models()
+    assert len(models) >= 1
+    labels = [e.label for e in models]
+    assert len(labels) == len(set(labels))            # labels are unique
+    assert all(os.path.exists(e.path) and e.links >= 1 for e in models)
+    assert any(e.label == "go2 [mjcf]" for e in models)
+    # the CLI default path resolves back to a discovered entry
+    assert entry_for_path(models, "mjcf", MJCF) is not None
+
+
 @pytest.mark.skipif(not (_have_mjcf and _have_urdf), reason="need both descriptions")
 def test_mjcf_urdf_leg_kinematics_agree():
     """Same robot, two formats: relative leg geometry must match (URDF has no

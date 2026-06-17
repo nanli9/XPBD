@@ -12,6 +12,12 @@ coincident-anchor distance constraints along the hinge axis (1 free DOF). Toggle
     uv run python examples/sim_robot_xpbd.py --format urdf --scene drop
     # open http://localhost:8080
 
+The **Model** dropdown hot-swaps the live robot between every URDF/MJCF model
+found in the sibling description repos (go2/b2/a2/go2w quadrupeds, g1/h1
+humanoids, …); physics rebuilds for the selected model. ``--format``/``--robot``
+just pick the initial one. (Unactuated models simply relax under gravity —
+quadrupeds behave most naturally.)
+
 * hang — base pinned in the air; the legs swing down under gravity and **settle**
   into a hanging rest pose (a pinned articulated chain is a pendulum, so a little
   velocity damping is applied — without it the undamped legs swing forever).
@@ -35,6 +41,7 @@ import trimesh
 import viser
 
 from xpbd3d.robot import load_mjcf, load_urdf
+from xpbd3d.robot.registry import discover_models, entry_for_path
 from xpbd3d.robot.viser_render import RobotView
 from xpbd3d.robot.xpbd_build import (build_xpbd, link_world_transforms,
                                      proxy_world_poses, read_state)
@@ -78,10 +85,21 @@ class RobotSim:
     def __init__(self, args):
         self.args = args
         self._lock = threading.RLock()
+        self._switching = False                  # guards dropdown re-entrancy
+
+        # Every loadable URDF/MJCF model on disk → the dropdown choices.
+        self.models = discover_models()
+        self.model_by_label = {e.label: e for e in self.models}
         path = args.path or resolve_path(args.format, args.robot)
-        print(f"[robot] loading {args.format.upper()}: {path}")
-        self.model = (load_mjcf if args.format == "mjcf" else load_urdf)(path)
-        print(f"[robot] {self.model}")
+        entry = entry_for_path(self.models, args.format, path)
+        if entry is None:                        # CLI path not in the repos: add it
+            from xpbd3d.robot.registry import ModelEntry
+            entry = ModelEntry(f"{os.path.basename(path)} [{args.format}]",
+                               args.format, path)
+            self.models.insert(0, entry)
+            self.model_by_label[entry.label] = entry
+        self.current_label = entry.label
+        print(f"[robot] {len(self.models)} models discovered")
 
         self.server = viser.ViserServer(host="0.0.0.0", port=args.port)
         try:
@@ -91,11 +109,23 @@ class RobotSim:
         self.server.scene.add_grid("/grid", width=4.0, height=4.0, cell_size=0.25,
                                    plane="xy", position=(0.0, 0.0, 0.0))
 
-        self.view = RobotView(self.server, self.model, lift=False,
-                              show_visual=True, show_collision=False)
+        self.view = None
         self._proxy_nodes = []
+        self._set_model(entry)                   # loads self.model + self.view
         self._build_physics(args.scene)
         self._build_gui()
+
+    def _set_model(self, entry):
+        """Load ``entry`` into ``self.model`` and (re)build its RobotView. Loads
+        the description first so a parse error leaves the current model intact."""
+        print(f"[robot] loading {entry.fmt.upper()}: {entry.path}")
+        model = (load_mjcf if entry.fmt == "mjcf" else load_urdf)(entry.path)
+        if self.view is not None:
+            self.view.remove()
+        self.model = model
+        self.view = RobotView(self.server, self.model, lift=False,
+                              show_visual=True, show_collision=False)
+        print(f"[robot] {self.model}")
 
     # -- physics --------------------------------------------------------------
     def _scene_damping(self, scene: str):
@@ -147,6 +177,11 @@ class RobotSim:
     # -- GUI ------------------------------------------------------------------
     def _build_gui(self):
         a = self.args
+        with self.server.gui.add_folder("Model"):
+            self.g_model = self.server.gui.add_dropdown(
+                "robot", tuple(e.label for e in self.models),
+                initial_value=self.current_label)
+            self.g_model.on_update(lambda _: self._switch_model(self.g_model.value))
         with self.server.gui.add_folder("Simulation"):
             self.g_pause = self.server.gui.add_checkbox("pause", False)
             self.g_scene = self.server.gui.add_dropdown("scene", ("hang", "drop"),
@@ -168,6 +203,7 @@ class RobotSim:
             self.p_bodies = self.server.gui.add_text("bodies (clusters)", str(self.solver.num_bodies))
             self.p_joints = self.server.gui.add_text("joint constraints", str(self.solver.num_joints))
             self.p_step = self.server.gui.add_text("step time", "—")
+            self.p_status = self.server.gui.add_text("status", "ok")
 
         self.g_scene.on_update(lambda _: self._reset(self.g_scene.value))
         self.g_reset.on_click(lambda _: self._reset(self.g_scene.value))
@@ -180,6 +216,37 @@ class RobotSim:
         self.g_visual.on_update(lambda _: self.view.set_visual_visible(self.g_visual.value))
         self.g_collision.on_update(lambda _: self.view.set_collision_visible(self.g_collision.value))
         self.g_boxes.on_update(lambda _: [setattr(h, "visible", self.g_boxes.value) for h in self._proxy_nodes])
+
+    def _switch_model(self, label):
+        """Swap the live robot from the dropdown: tear down the current view, load
+        the chosen description, and rebuild physics for the current scene. On any
+        load/build error the previous model is restored and the dropdown reverts."""
+        if self._switching or label == self.current_label:
+            return
+        entry = self.model_by_label.get(label)
+        if entry is None:
+            return
+        self._switching = True
+        try:
+            with self._lock:
+                prev = self.model_by_label[self.current_label]
+                try:
+                    self._set_model(entry)
+                    self.current_label = label
+                    self._reset(self.g_scene.value)         # physics for the new model
+                    self.view.set_visual_visible(self.g_visual.value)
+                    self.view.set_collision_visible(self.g_collision.value)
+                    self.p_status.value = f"{entry.links} links / {entry.actuated} act"
+                except Exception as ex:
+                    self.p_status.value = f"FAILED {label}: {type(ex).__name__}: {ex}"[:80]
+                    try:                                    # best-effort restore
+                        self._set_model(prev)
+                        self._reset(self.g_scene.value)
+                    except Exception:
+                        pass
+                    self.g_model.value = self.current_label
+        finally:
+            self._switching = False
 
     def _set(self, attr, val):
         with self._lock:
@@ -213,11 +280,12 @@ class RobotSim:
             state = read_state(self.phys)          # single host readback per frame
             world = link_world_transforms(self.phys, state)
             poses = proxy_world_poses(self.phys, state) if self.g_boxes.value else None
+            view, proxy_nodes = self.view, self._proxy_nodes   # consistent w/ world
         dt = time.perf_counter() - t0
-        self.view.update_world(world)
+        view.update_world(world)
         if poses is not None:
             with self.server.atomic():
-                for h, (center, wxyz) in zip(self._proxy_nodes, poses):
+                for h, (center, wxyz) in zip(proxy_nodes, poses):
                     h.position = center
                     h.wxyz = wxyz
         self.p_step.value = f"{dt * 1000.0:.2f} ms"

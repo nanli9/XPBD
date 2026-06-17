@@ -39,6 +39,8 @@ from . import kernels_bvh as KB
 from . import kernels_hashgrid as KH
 from .solver import _grid_candidate_pairs
 
+FULL64 = (1 << 64) - 1          # all collision-category/mask bits set (collide all)
+
 
 @dataclass
 class RigidBody:
@@ -48,6 +50,9 @@ class RigidBody:
     static: bool = False
     is_particle: bool = False
     group: int = 0
+    shape_type: int = 0          # 0 = box, 1 = capsule (sphere = capsule, half_len 0)
+    radius: float = 0.0          # capsule/sphere radius
+    half_len: float = 0.0        # capsule segment half-length (along body-local +Z)
 
 
 def _world_aabb_half(q, he):
@@ -127,6 +132,11 @@ class Solver6DOF:
         self._inv_I: list = []
         self._he: list = []
         self._group: list = []
+        self._cat: list = []         # collision category bits (default: all set)
+        self._mask: list = []        # collision mask bits (default: all set)
+        self._shape_type: list = []
+        self._shape_r: list = []
+        self._shape_hl: list = []
         self.bodies: list[RigidBody] = []
         self._dirty = True
 
@@ -142,6 +152,8 @@ class Solver6DOF:
         self.x = self.q = self.v = self.omega = None
         self.x_prev = self.q_prev = None
         self.inv_mass = self.inv_I = self.he = self.cgroup = None
+        self.ccat = self.cmask = None
+        self.shape_type = self.shape_r = self.shape_hl = None
         self.dx = self.drot = self.dcount = None
         self.dv = self.dw = self.dvc = None
         self.lam_floor = None
@@ -164,7 +176,8 @@ class Solver6DOF:
 
     # ---- scene building -----------------------------------------------------
     def _add_body(self, position, half_extents, mass, quaternion, velocity,
-                  omega, color, static, is_particle, group):
+                  omega, color, static, is_particle, group,
+                  shape_type=0, radius=0.0, half_len=0.0):
         idx = len(self._x)
         he = tuple(float(h) for h in half_extents)
         self._x.append(tuple(float(p) for p in position))
@@ -184,9 +197,16 @@ class Solver6DOF:
             self._inv_I.append(_box_inv_inertia(he, float(mass)))
         self._he.append(he)
         self._group.append(int(group))
+        self._cat.append(FULL64)            # default: collide everything
+        self._mask.append(FULL64)
+        self._shape_type.append(int(shape_type))
+        self._shape_r.append(float(radius))
+        self._shape_hl.append(float(half_len))
         self._dirty = True
         rb = RigidBody(index=idx, half_extents=he, color=color, static=static,
-                       is_particle=is_particle, group=int(group))
+                       is_particle=is_particle, group=int(group),
+                       shape_type=int(shape_type), radius=float(radius),
+                       half_len=float(half_len))
         self.bodies.append(rb)
         return rb
 
@@ -195,6 +215,41 @@ class Solver6DOF:
                 omega=(0.0, 0.0, 0.0), color=(0.6, 0.6, 0.75), static=False):
         return self._add_body(position, half_extents, mass, quaternion, velocity,
                               omega, color, static, is_particle=False, group=0)
+
+    def add_capsule(self, position, radius, half_len, mass,
+                    quaternion=(0.0, 0.0, 0.0, 1.0), velocity=(0.0, 0.0, 0.0),
+                    omega=(0.0, 0.0, 0.0), color=(0.6, 0.6, 0.75), static=False,
+                    group=0):
+        """A capsule: a segment of half-length ``half_len`` along the body-local
+        +Z axis, inflated by ``radius``. Its bounding ``he`` = (r, r, half_len+r)
+        feeds the existing OBB broad phase unchanged; the narrow phase resolves it
+        as a true capsule (segment-segment / segment-OBB closest distance)."""
+        r = float(radius)
+        he = (r, r, float(half_len) + r)
+        return self._add_body(position, he, mass, quaternion, velocity, omega,
+                              color, static, is_particle=False, group=group,
+                              shape_type=1, radius=r, half_len=float(half_len))
+
+    def add_sphere(self, position, radius, mass, velocity=(0.0, 0.0, 0.0),
+                   color=(0.6, 0.6, 0.75), static=False, group=0):
+        """A sphere = capsule with zero segment length."""
+        return self.add_capsule(position, radius, 0.0, mass, (0.0, 0.0, 0.0, 1.0),
+                                velocity, (0.0, 0.0, 0.0), color, static, group)
+
+    def add_cylinder(self, position, radius, half_len, mass,
+                     quaternion=(0.0, 0.0, 0.0, 1.0), velocity=(0.0, 0.0, 0.0),
+                     omega=(0.0, 0.0, 0.0), color=(0.6, 0.6, 0.75), static=False,
+                     group=0):
+        """A cylinder with **flat caps**: radius ``radius``, half-length
+        ``half_len`` along the body-local +Z axis. Differs from a capsule only at
+        floor contact (flat face / rim / side, via ``solve_floor_cylinder``);
+        body-body contacts use the capsule approximation. ``he`` = (r, r, half_len)
+        bounds it for the OBB broad phase."""
+        r = float(radius)
+        he = (r, r, float(half_len))
+        return self._add_body(position, he, mass, quaternion, velocity, omega,
+                              color, static, is_particle=False, group=group,
+                              shape_type=2, radius=r, half_len=float(half_len))
 
     def add_particle(self, position, mass, radius=0.015,
                      velocity=(0.0, 0.0, 0.0), color=(0.85, 0.3, 0.35),
@@ -228,6 +283,17 @@ class Solver6DOF:
         self._dirty = True
         return len(self._j_a) - 1
 
+    def set_collision_filter(self, idx, category, mask):
+        """MuJoCo-style per-body collision bitmask. Two bodies ``a``/``b`` collide
+        only if ``(cat[a] & mask[b]) != 0`` and ``(cat[b] & mask[a]) != 0`` (in
+        addition to the group filter). Default is all-bits/all-bits, i.e. collide
+        everything. Giving each body a unique category bit and clearing a neighbour's
+        bit from this body's mask excludes exactly that one pair — used to skip
+        joint-adjacent robot links while still colliding the rest of the linkage."""
+        self._cat[int(idx)] = int(category) & FULL64
+        self._mask[int(idx)] = int(mask) & FULL64
+        self._dirty = True
+
     # ---- broad phase (legacy grid; LBVH path is on device in step) ----------
     def _rebuild_pairs(self):
         pos = self.x.numpy().reshape(-1, 3)
@@ -253,8 +319,11 @@ class Solver6DOF:
         keep = np.all(sep <= 0.0, axis=1)
         a = ga[keep].astype(np.int32); b = gb[keep].astype(np.int32)
         grp = np.asarray(self._group, np.int32)
+        cat = np.asarray(self._cat, np.uint64)
+        mask = np.asarray(self._mask, np.uint64)
         live = (inv_m[a] > 0.0) | (inv_m[b] > 0.0)              # drop static-static
         live &= ~((grp[a] == grp[b]) & (grp[a] > 0))           # drop same no-self group
+        live &= ((cat[a] & mask[b]) != np.uint64(0)) & ((cat[b] & mask[a]) != np.uint64(0))
         return a[live], b[live]
 
     # ---- flush --------------------------------------------------------------
@@ -287,6 +356,11 @@ class Solver6DOF:
         self.inv_I = wp.array(np.asarray(self._inv_I, np.float32).reshape(-1, 3), dtype=wp.vec3, device=dev)
         self.he = wp.array(np.asarray(self._he, np.float32).reshape(-1, 3), dtype=wp.vec3, device=dev)
         self.cgroup = wp.array(np.asarray(self._group, np.int32), dtype=int, device=dev)
+        self.ccat = wp.array(np.asarray(self._cat, np.uint64), dtype=wp.uint64, device=dev)
+        self.cmask = wp.array(np.asarray(self._mask, np.uint64), dtype=wp.uint64, device=dev)
+        self.shape_type = wp.array(np.asarray(self._shape_type, np.int32), dtype=int, device=dev)
+        self.shape_r = wp.array(np.asarray(self._shape_r, np.float32), dtype=float, device=dev)
+        self.shape_hl = wp.array(np.asarray(self._shape_hl, np.float32), dtype=float, device=dev)
         self.dx = wp.zeros(n, dtype=wp.vec3, device=dev)
         self.drot = wp.zeros(n, dtype=wp.vec3, device=dev)
         self.dcount = wp.zeros(n, dtype=int, device=dev)
@@ -376,8 +450,15 @@ class Solver6DOF:
             if nj:
                 self.lam_joint.zero_()
             wp.launch(K6.generate_box_manifold, dim=cap,
-                      inputs=[self.x, self.q, self.he, self.pair_a, self.pair_b,
+                      inputs=[self.x, self.q, self.he, self.shape_type,
+                              self.pair_a, self.pair_b,
                               self.n_pairs_dev, man_margin, self.poly],
+                      outputs=[self.m_count, self.m_inc, self.m_ref, self.m_normal,
+                               self.m_off_inc, self.m_off_ref], device=dev)
+            wp.launch(K6.generate_capsule_manifold, dim=cap,
+                      inputs=[self.x, self.q, self.he, self.shape_type,
+                              self.shape_r, self.shape_hl, self.pair_a, self.pair_b,
+                              self.n_pairs_dev, man_margin],
                       outputs=[self.m_count, self.m_inc, self.m_ref, self.m_normal,
                                self.m_off_inc, self.m_off_ref], device=dev)
             for _it in range(self.iterations):
@@ -390,7 +471,19 @@ class Solver6DOF:
                               outputs=[self.dx, self.drot, self.dcount], device=dev)
                 wp.launch(K6.solve_floor_contacts, dim=n,
                           inputs=[self.x, self.q, self.x_prev, self.q_prev,
-                                  self.inv_mass, self.inv_I, self.he,
+                                  self.inv_mass, self.inv_I, self.he, self.shape_type,
+                                  self.floor_y, mu, self.lam_floor, h],
+                          outputs=[self.dx, self.drot, self.dcount], device=dev)
+                wp.launch(K6.solve_floor_capsule, dim=n,
+                          inputs=[self.x, self.q, self.x_prev, self.q_prev,
+                                  self.inv_mass, self.inv_I, self.shape_type,
+                                  self.shape_r, self.shape_hl,
+                                  self.floor_y, mu, self.lam_floor, h],
+                          outputs=[self.dx, self.drot, self.dcount], device=dev)
+                wp.launch(K6.solve_floor_cylinder, dim=n,
+                          inputs=[self.x, self.q, self.x_prev, self.q_prev,
+                                  self.inv_mass, self.inv_I, self.shape_type,
+                                  self.shape_r, self.shape_hl,
                                   self.floor_y, mu, self.lam_floor, h],
                           outputs=[self.dx, self.drot, self.dcount], device=dev)
                 wp.launch(K6.solve_box_manifold, dim=cap,
@@ -408,8 +501,20 @@ class Solver6DOF:
                       outputs=[self.v, self.omega], device=dev)
             wp.launch(K6.velocity_floor, dim=n,
                       inputs=[self.x, self.q, self.inv_mass, self.inv_I, self.he,
-                              self.floor_y, mu, self.restitution, self.lam_floor, h,
-                              self.v, self.omega],
+                              self.shape_type, self.floor_y, mu, self.restitution,
+                              self.lam_floor, h, self.v, self.omega],
+                      outputs=[self.dv, self.dw, self.dvc], device=dev)
+            wp.launch(K6.velocity_floor_capsule, dim=n,
+                      inputs=[self.x, self.q, self.inv_mass, self.inv_I,
+                              self.shape_type, self.shape_r, self.shape_hl,
+                              self.floor_y, mu, self.restitution,
+                              self.lam_floor, h, self.v, self.omega],
+                      outputs=[self.dv, self.dw, self.dvc], device=dev)
+            wp.launch(K6.velocity_floor_cylinder, dim=n,
+                      inputs=[self.x, self.q, self.inv_mass, self.inv_I,
+                              self.shape_type, self.shape_r, self.shape_hl,
+                              self.floor_y, mu, self.restitution,
+                              self.lam_floor, h, self.v, self.omega],
                       outputs=[self.dv, self.dw, self.dvc], device=dev)
             wp.launch(K6.velocity_box, dim=cap,
                       inputs=[self.x, self.q, self.inv_mass, self.inv_I,
@@ -438,7 +543,7 @@ class Solver6DOF:
         self.bvh.rebuild()
         wp.launch(KB.emit_pairs, dim=n,
                   inputs=[self.bvh.id, self.lowers, self.uppers, self.inv_mass,
-                          self.cgroup, self.cap],
+                          self.cgroup, self.ccat, self.cmask, self.cap],
                   outputs=[self.n_pairs_dev, self.pair_a, self.pair_b], device=dev)
         cnt = int(self.n_pairs_dev.numpy()[0])
         if cnt > self.cap:                       # overflow → grow + re-emit once
@@ -447,7 +552,7 @@ class Solver6DOF:
             self.n_pairs_dev.zero_()
             wp.launch(KB.emit_pairs, dim=n,
                       inputs=[self.bvh.id, self.lowers, self.uppers, self.inv_mass,
-                              self.cgroup, self.cap],
+                              self.cgroup, self.ccat, self.cmask, self.cap],
                       outputs=[self.n_pairs_dev, self.pair_a, self.pair_b], device=dev)
             cnt = int(self.n_pairs_dev.numpy()[0])
             self._graph = None
@@ -461,8 +566,8 @@ class Solver6DOF:
         self.hgrid.build(self.x, self._hg_cell)
         self.n_pairs_dev.zero_()
         args = [self.hgrid.id, self.x, self.q, self.v, self.omega, self.he,
-                self.inv_mass, self.cgroup, self._man_margin, self.dt,
-                self._hg_rsmax, self._hg_cell]
+                self.inv_mass, self.cgroup, self.ccat, self.cmask, self._man_margin,
+                self.dt, self._hg_rsmax, self._hg_cell]
         wp.launch(KH.emit_pairs_hashgrid, dim=n,
                   inputs=args + [self.cap],
                   outputs=[self.n_pairs_dev, self.pair_a, self.pair_b], device=dev)

@@ -44,6 +44,8 @@ def emit_pairs_hashgrid(
     he: wp.array(dtype=wp.vec3),
     inv_mass: wp.array(dtype=float),
     cgroup: wp.array(dtype=int),
+    ccat: wp.array(dtype=wp.uint64),
+    cmask: wp.array(dtype=wp.uint64),
     man_margin: float,
     dt: float,
     rs_max: float,                       # largest bounding-sphere radius in the scene
@@ -63,6 +65,7 @@ def emit_pairs_hashgrid(
     qr = wp.min(rs_i + rs_max + man_margin + mi, cell)
     half_i = aabb_half(q[i], e_i)
     xi = x[i]
+    zero = wp.uint64(0)
     query = wp.hash_grid_query(grid, xi, qr)
     j = int(0)
     while wp.hash_grid_query_next(query, j):
@@ -70,6 +73,8 @@ def emit_pairs_hashgrid(
         if inv_mass[i] == 0.0 and inv_mass[j] == 0.0:
             keep = False
         if cgroup[i] == cgroup[j] and cgroup[i] > 0:
+            keep = False
+        if ((ccat[i] & cmask[j]) == zero) or ((ccat[j] & cmask[i]) == zero):
             keep = False
         if keep:
             e_j = he[j]

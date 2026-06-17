@@ -22,6 +22,15 @@ import warp as wp
 
 EPS = wp.constant(1.0e-9)
 
+# Collision shape types (per body). A sphere is a capsule with zero segment
+# half-length. Capsules and cylinders both extend along the body-local +Z axis
+# and share the body-body narrow phase (segment + radius); they differ at the
+# floor, where a CYLINDER uses its flat caps / rim exactly (solve_floor_cylinder)
+# while a CAPSULE uses rounded ends.
+SHAPE_BOX = wp.constant(0)
+SHAPE_CAPSULE = wp.constant(1)
+SHAPE_CYLINDER = wp.constant(2)
+
 
 # -----------------------------------------------------------------------------
 # Quaternion / inertia helpers
@@ -164,6 +173,7 @@ def solve_floor_contacts(
     inv_mass: wp.array(dtype=float),
     inv_I: wp.array(dtype=wp.vec3),
     he: wp.array(dtype=wp.vec3),
+    shape_type: wp.array(dtype=int),
     floor_y: float,
     mu_s: float,
     lam_floor: wp.array(dtype=float),   # n_boxes * 8
@@ -175,6 +185,8 @@ def solve_floor_contacts(
 ):
     i = wp.tid()
     if inv_mass[i] == 0.0:
+        return
+    if shape_type[i] != 0:              # capsules/spheres → solve_floor_capsule
         return
     s = wp.vec3(0.0, 1.0, 0.0)  # floor separation normal points up
     for c in range(8):
@@ -211,6 +223,156 @@ def solve_floor_contacts(
                     wp.atomic_add(drot, i, world_invI_mul(q[i], inv_I[i], wp.cross(r, pf)))
 
 
+@wp.kernel
+def solve_floor_capsule(
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    x_prev: wp.array(dtype=wp.vec3),
+    q_prev: wp.array(dtype=wp.quat),
+    inv_mass: wp.array(dtype=float),
+    inv_I: wp.array(dtype=wp.vec3),
+    shape_type: wp.array(dtype=int),
+    shape_r: wp.array(dtype=float),
+    shape_hl: wp.array(dtype=float),
+    floor_y: float,
+    mu_s: float,
+    lam_floor: wp.array(dtype=float),
+    h: float,
+    dx: wp.array(dtype=wp.vec3),
+    drot: wp.array(dtype=wp.vec3),
+    dcount: wp.array(dtype=int),
+):
+    """Capsule/sphere vs floor: the two segment endpoints (one for a sphere) are
+    tested as spheres against the plane y = floor_y. Mirrors the box-corner path
+    (slots 0..1 of ``lam_floor``)."""
+    i = wp.tid()
+    if inv_mass[i] == 0.0:
+        return
+    if shape_type[i] != 1:             # capsule/sphere only (cylinder → its own kernel)
+        return
+    s = wp.vec3(0.0, 1.0, 0.0)
+    rc = shape_r[i]
+    hl = shape_hl[i]
+    nend = wp.where(hl < EPS, 1, 2)
+    for c in range(2):
+        slot = i * 8 + c
+        if c >= nend:
+            lam_floor[slot] = 0.0
+            continue
+        sgn = wp.where(c == 0, -1.0, 1.0)
+        off = wp.vec3(0.0, 0.0, sgn * hl)
+        p1 = x[i] + wp.quat_rotate(q[i], off) - s * rc   # lowest cap-surface point
+        d = floor_y - p1[1]
+        if d <= 0.0:
+            lam_floor[slot] = 0.0
+            continue
+        r = p1 - x[i]
+        w = gen_inv_mass(inv_mass[i], q[i], inv_I[i], r, s)
+        if w <= 0.0:
+            continue
+        dlam = d / w
+        lam_floor[slot] = dlam
+        p = dlam * s
+        wp.atomic_add(dx, i, p * inv_mass[i])
+        wp.atomic_add(drot, i, world_invI_mul(q[i], inv_I[i], wp.cross(r, p)))
+        wp.atomic_add(dcount, i, 1)
+        if mu_s > 0.0:
+            p1b = x_prev[i] + wp.quat_rotate(q_prev[i], off) - s * rc
+            dp = p1 - p1b
+            dpt = dp - s * wp.dot(dp, s)
+            lt = wp.length(dpt)
+            if lt > EPS and lt < mu_s * d:
+                w2 = gen_inv_mass(inv_mass[i], q[i], inv_I[i], r, dpt / lt)
+                if w2 > 0.0:
+                    pf = -dpt / w2
+                    wp.atomic_add(dx, i, pf * inv_mass[i])
+                    wp.atomic_add(drot, i, world_invI_mul(q[i], inv_I[i], wp.cross(r, pf)))
+
+
+@wp.kernel
+def solve_floor_cylinder(
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    x_prev: wp.array(dtype=wp.vec3),
+    q_prev: wp.array(dtype=wp.quat),
+    inv_mass: wp.array(dtype=float),
+    inv_I: wp.array(dtype=wp.vec3),
+    shape_type: wp.array(dtype=int),
+    shape_r: wp.array(dtype=float),
+    shape_hl: wp.array(dtype=float),
+    floor_y: float,
+    mu_s: float,
+    lam_floor: wp.array(dtype=float),
+    h: float,
+    dx: wp.array(dtype=wp.vec3),
+    drot: wp.array(dtype=wp.vec3),
+    dcount: wp.array(dtype=int),
+):
+    """Cylinder vs floor with **flat caps** (unlike a capsule). Each cap's rim is
+    sampled at 4 points — one aligned with the downhill direction, so the true
+    lowest rim point is always tested. This rests a vertical cylinder on its flat
+    face, a horizontal one on a side line, a tilted one on a rim edge — exactly a
+    cylinder, not a rounded capsule. Uses all 8 ``lam_floor`` slots (2 caps × 4)."""
+    i = wp.tid()
+    if inv_mass[i] == 0.0:
+        return
+    if shape_type[i] != 2:
+        return
+    s = wp.vec3(0.0, 1.0, 0.0)
+    r = shape_r[i]
+    hl = shape_hl[i]
+    a = wp.quat_rotate(q[i], wp.vec3(0.0, 0.0, 1.0))    # cylinder axis (world)
+    perp = s - a * wp.dot(s, a)                         # "up" projected ⟂ to axis
+    plen = wp.length(perp)
+    if plen > 1.0e-5:
+        d1 = -perp / plen                              # downhill in the rim plane
+    else:                                              # axis ≈ vertical → any basis
+        tmp = wp.vec3(1.0, 0.0, 0.0)
+        if wp.abs(a[0]) > 0.9:
+            tmp = wp.vec3(0.0, 1.0, 0.0)
+        d1 = wp.normalize(wp.cross(a, tmp))
+    d2 = wp.normalize(wp.cross(a, d1))
+    for cap in range(2):
+        capoff = a * (wp.where(cap == 0, -1.0, 1.0) * hl)
+        for jj in range(4):
+            if jj == 0:
+                dirv = d1
+            elif jj == 1:
+                dirv = d2
+            elif jj == 2:
+                dirv = d1 * (-1.0)
+            else:
+                dirv = d2 * (-1.0)
+            roff = capoff + dirv * r                    # rim point, offset from centre
+            p1 = x[i] + roff
+            slot = i * 8 + cap * 4 + jj
+            d = floor_y - p1[1]
+            if d <= 0.0:
+                lam_floor[slot] = 0.0
+                continue
+            w = gen_inv_mass(inv_mass[i], q[i], inv_I[i], roff, s)
+            if w <= 0.0:
+                continue
+            dlam = d / w
+            lam_floor[slot] = dlam
+            p = dlam * s
+            wp.atomic_add(dx, i, p * inv_mass[i])
+            wp.atomic_add(drot, i, world_invI_mul(q[i], inv_I[i], wp.cross(roff, p)))
+            wp.atomic_add(dcount, i, 1)
+            if mu_s > 0.0:
+                roff_local = wp.quat_rotate_inv(q[i], roff)
+                p1b = x_prev[i] + wp.quat_rotate(q_prev[i], roff_local)
+                dp = p1 - p1b
+                dpt = dp - s * wp.dot(dp, s)
+                lt = wp.length(dpt)
+                if lt > EPS and lt < mu_s * d:
+                    w2 = gen_inv_mass(inv_mass[i], q[i], inv_I[i], roff, dpt / lt)
+                    if w2 > 0.0:
+                        pf = -dpt / w2
+                        wp.atomic_add(dx, i, pf * inv_mass[i])
+                        wp.atomic_add(drot, i, world_invI_mul(q[i], inv_I[i], wp.cross(roff, pf)))
+
+
 # -----------------------------------------------------------------------------
 # Box-box contact manifold: face-axis SAT + Sutherland-Hodgman face clip
 # -----------------------------------------------------------------------------
@@ -235,6 +397,7 @@ def generate_box_manifold(
     x: wp.array(dtype=wp.vec3),
     q: wp.array(dtype=wp.quat),
     he: wp.array(dtype=wp.vec3),
+    shape_type: wp.array(dtype=int),
     pair_a: wp.array(dtype=int),
     pair_b: wp.array(dtype=int),
     pair_count: wp.array(dtype=int),     # device-side live pair count (graph gate)
@@ -254,6 +417,8 @@ def generate_box_manifold(
         return
     a = pair_a[pid]
     b = pair_b[pid]
+    if shape_type[a] != 0 or shape_type[b] != 0:
+        return                           # non-box pair → handled by capsule kernel
     cA = x[a]; cB = x[b]
     eA = he[a]; eB = he[b]
     RA = wp.quat_to_matrix(q[a])
@@ -431,6 +596,160 @@ def solve_box_manifold(
 
 
 # -----------------------------------------------------------------------------
+# Capsule / sphere narrow phase. A capsule is a segment (along body-local +Z,
+# half-length ``hl``) inflated by radius ``r``; a sphere is ``hl = 0``. Contacts
+# reduce to the closest distance between two such segments (or a segment and an
+# OBB), then a sphere test — far simpler than the box SAT + clip above, and they
+# fill the SAME manifold buffers, so ``solve_box_manifold`` / ``velocity_box``
+# resolve them unchanged (the contact solve is geometry-agnostic).
+# -----------------------------------------------------------------------------
+@wp.func
+def capsule_seg(xc: wp.vec3, qc: wp.quat, hl: float):
+    """World endpoints of a capsule's core segment (body-local +Z axis)."""
+    ax = wp.quat_rotate(qc, wp.vec3(0.0, 0.0, 1.0))
+    return xc - ax * hl, xc + ax * hl
+
+
+@wp.func
+def closest_seg_seg(p1: wp.vec3, q1: wp.vec3, p2: wp.vec3, q2: wp.vec3):
+    """Closest points between segments [p1,q1] and [p2,q2] (Ericson §5.1.9)."""
+    d1 = q1 - p1
+    d2 = q2 - p2
+    r = p1 - p2
+    a = wp.dot(d1, d1)
+    e = wp.dot(d2, d2)
+    f = wp.dot(d2, r)
+    s = float(0.0)
+    t = float(0.0)
+    if a <= EPS and e <= EPS:
+        return p1, p2
+    if a <= EPS:
+        t = wp.clamp(f / e, 0.0, 1.0)
+    else:
+        c = wp.dot(d1, r)
+        if e <= EPS:
+            s = wp.clamp(-c / a, 0.0, 1.0)
+        else:
+            b = wp.dot(d1, d2)
+            denom = a * e - b * b
+            if denom > EPS:
+                s = wp.clamp((b * f - c * e) / denom, 0.0, 1.0)
+            t = (b * s + f) / e
+            if t < 0.0:
+                t = 0.0
+                s = wp.clamp(-c / a, 0.0, 1.0)
+            elif t > 1.0:
+                t = 1.0
+                s = wp.clamp((b - c) / a, 0.0, 1.0)
+    return p1 + d1 * s, p2 + d2 * t
+
+
+@wp.func
+def closest_pt_obb(p: wp.vec3, c: wp.vec3, qb: wp.quat, he: wp.vec3) -> wp.vec3:
+    """Closest point on box (c, qb, he) to world point ``p``."""
+    local = wp.quat_rotate_inv(qb, p - c)
+    cl = wp.vec3(wp.clamp(local[0], -he[0], he[0]),
+                 wp.clamp(local[1], -he[1], he[1]),
+                 wp.clamp(local[2], -he[2], he[2]))
+    return c + wp.quat_rotate(qb, cl)
+
+
+@wp.kernel
+def generate_capsule_manifold(
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    he: wp.array(dtype=wp.vec3),
+    shape_type: wp.array(dtype=int),
+    shape_r: wp.array(dtype=float),
+    shape_hl: wp.array(dtype=float),
+    pair_a: wp.array(dtype=int),
+    pair_b: wp.array(dtype=int),
+    pair_count: wp.array(dtype=int),
+    margin: float,
+    # outputs (same buffers as the box manifold)
+    m_count: wp.array(dtype=int),
+    m_inc: wp.array(dtype=int),
+    m_ref: wp.array(dtype=int),
+    m_normal: wp.array(dtype=wp.vec3),
+    m_off_inc: wp.array(dtype=wp.vec3),
+    m_off_ref: wp.array(dtype=wp.vec3),
+):
+    pid = wp.tid()
+    if pid >= pair_count[0]:
+        return
+    a = pair_a[pid]
+    b = pair_b[pid]
+    sa = shape_type[a]
+    sb = shape_type[b]
+    if sa == 0 and sb == 0:
+        return                              # box-box → handled by box manifold
+
+    if sa != 0 and sb != 0:
+        # capsule/sphere/cylinder vs same: treat each as a segment + radius (a
+        # cylinder uses its capsule approximation here for body-body contacts; its
+        # floor contact is handled exactly by solve_floor_cylinder). 1 contact.
+        p1, e1 = capsule_seg(x[a], q[a], shape_hl[a])
+        p2, e2 = capsule_seg(x[b], q[b], shape_hl[b])
+        c1, c2 = closest_seg_seg(p1, e1, p2, e2)
+        delta = c1 - c2
+        dist = wp.length(delta)
+        ra = shape_r[a]
+        rb = shape_r[b]
+        if dist - (ra + rb) < margin:
+            n = wp.vec3(0.0, 1.0, 0.0)
+            if dist > EPS:
+                n = delta / dist            # B→A; inc=A pushed +n
+            pa = c1 - n * ra
+            pb = c2 + n * rb
+            m_off_inc[pid * 8 + 0] = wp.quat_rotate_inv(q[a], pa - x[a])
+            m_off_ref[pid * 8 + 0] = wp.quat_rotate_inv(q[b], pb - x[b])
+            m_normal[pid] = n
+            m_inc[pid] = a
+            m_ref[pid] = b
+            m_count[pid] = 1
+        else:
+            m_count[pid] = 0
+        return
+
+    # box vs capsule: box is the reference, capsule the incident. Use the capsule
+    # endpoint nearest the box (sphere-vs-OBB) as a single contact.
+    boxb = wp.where(sa == 0, a, b)
+    capb = wp.where(sa == 0, b, a)
+    rc = shape_r[capb]
+    pc0, pc1 = capsule_seg(x[capb], q[capb], shape_hl[capb])
+    cp0 = closest_pt_obb(pc0, x[boxb], q[boxb], he[boxb])
+    cp1 = closest_pt_obb(pc1, x[boxb], q[boxb], he[boxb])
+    d0 = wp.length(pc0 - cp0)
+    d1 = wp.length(pc1 - cp1)
+    # pick the endpoint with the smaller surface separation (deepest contact)
+    ec = pc0
+    cb = cp0
+    dd = d0
+    if (d1 - rc) < (d0 - rc):
+        ec = pc1
+        cb = cp1
+        dd = d1
+    if dd - rc < margin:
+        inside, sout, dpen = obb_penetration(ec, x[boxb], q[boxb], he[boxb])
+        n = sout                            # box→capsule
+        pref = cb
+        if not inside and dd > EPS:
+            n = (ec - cb) / dd
+            pref = cb
+        else:
+            pref = ec - n * dpen            # project centre to nearest box face
+        pinc = ec - n * rc
+        m_off_inc[pid * 8 + 0] = wp.quat_rotate_inv(q[capb], pinc - x[capb])
+        m_off_ref[pid * 8 + 0] = wp.quat_rotate_inv(q[boxb], pref - x[boxb])
+        m_normal[pid] = n
+        m_inc[pid] = capb
+        m_ref[pid] = boxb
+        m_count[pid] = 1
+    else:
+        m_count[pid] = 0
+
+
+# -----------------------------------------------------------------------------
 # Joints: compliant XPBD distance/attachment constraint between local anchor
 # points on any two bodies (Macklin 2016 Eq. 18; Müller 2020 §3.3 positional
 # constraint). Covers cloth edges (anchors at body centres, particles with
@@ -545,6 +864,7 @@ def velocity_floor(
     inv_mass: wp.array(dtype=float),
     inv_I: wp.array(dtype=wp.vec3),
     he: wp.array(dtype=wp.vec3),
+    shape_type: wp.array(dtype=int),
     floor_y: float,
     mu_d: float,
     restitution: float,
@@ -558,6 +878,8 @@ def velocity_floor(
 ):
     i = wp.tid()
     if inv_mass[i] == 0.0:
+        return
+    if shape_type[i] != 0:              # capsules/spheres → velocity_floor_capsule
         return
     s = wp.vec3(0.0, 1.0, 0.0)
     for c in range(8):
@@ -588,6 +910,140 @@ def velocity_floor(
                 wp.atomic_add(dv, i, p * inv_mass[i])
                 wp.atomic_add(dw, i, world_invI_mul(q[i], inv_I[i], wp.cross(r, p)))
                 wp.atomic_add(dvc, i, 1)
+
+
+@wp.kernel
+def velocity_floor_capsule(
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    inv_mass: wp.array(dtype=float),
+    inv_I: wp.array(dtype=wp.vec3),
+    shape_type: wp.array(dtype=int),
+    shape_r: wp.array(dtype=float),
+    shape_hl: wp.array(dtype=float),
+    floor_y: float,
+    mu_d: float,
+    restitution: float,
+    lam_floor: wp.array(dtype=float),
+    h: float,
+    v: wp.array(dtype=wp.vec3),
+    omega: wp.array(dtype=wp.vec3),
+    dv: wp.array(dtype=wp.vec3),
+    dw: wp.array(dtype=wp.vec3),
+    dvc: wp.array(dtype=int),
+):
+    """Dynamic friction + restitution for capsule/sphere floor contacts."""
+    i = wp.tid()
+    if inv_mass[i] == 0.0:
+        return
+    if shape_type[i] != 1:             # capsule/sphere only (cylinder → its own kernel)
+        return
+    s = wp.vec3(0.0, 1.0, 0.0)
+    rc = shape_r[i]
+    hl = shape_hl[i]
+    for c in range(2):
+        slot = i * 8 + c
+        lam_n = lam_floor[slot]
+        if lam_n == 0.0:
+            continue
+        sgn = wp.where(c == 0, -1.0, 1.0)
+        off = wp.vec3(0.0, 0.0, sgn * hl)
+        r = wp.quat_rotate(q[i], off) - s * rc
+        vc = v[i] + wp.cross(omega[i], r)
+        vn = wp.dot(vc, s)
+        vt = vc - s * vn
+        ltan = wp.length(vt)
+        impulse = wp.vec3(0.0, 0.0, 0.0)
+        if mu_d > 0.0 and ltan > EPS:
+            fn = lam_n / (h * h)
+            dvm = wp.min(h * mu_d * wp.abs(fn), ltan)
+            impulse = impulse - (vt / ltan) * dvm
+        if vn < 0.0:
+            impulse = impulse + s * (-vn + wp.max(-restitution * vn, 0.0))
+        if wp.length(impulse) > EPS:
+            w = gen_inv_mass(inv_mass[i], q[i], inv_I[i], r, impulse / wp.length(impulse))
+            if w > 0.0:
+                p = impulse / w
+                wp.atomic_add(dv, i, p * inv_mass[i])
+                wp.atomic_add(dw, i, world_invI_mul(q[i], inv_I[i], wp.cross(r, p)))
+                wp.atomic_add(dvc, i, 1)
+
+
+@wp.kernel
+def velocity_floor_cylinder(
+    x: wp.array(dtype=wp.vec3),
+    q: wp.array(dtype=wp.quat),
+    inv_mass: wp.array(dtype=float),
+    inv_I: wp.array(dtype=wp.vec3),
+    shape_type: wp.array(dtype=int),
+    shape_r: wp.array(dtype=float),
+    shape_hl: wp.array(dtype=float),
+    floor_y: float,
+    mu_d: float,
+    restitution: float,
+    lam_floor: wp.array(dtype=float),
+    h: float,
+    v: wp.array(dtype=wp.vec3),
+    omega: wp.array(dtype=wp.vec3),
+    dv: wp.array(dtype=wp.vec3),
+    dw: wp.array(dtype=wp.vec3),
+    dvc: wp.array(dtype=int),
+):
+    """Dynamic friction + restitution for cylinder floor contacts (same 8 rim
+    samples as ``solve_floor_cylinder``)."""
+    i = wp.tid()
+    if inv_mass[i] == 0.0:
+        return
+    if shape_type[i] != 2:
+        return
+    s = wp.vec3(0.0, 1.0, 0.0)
+    r = shape_r[i]
+    hl = shape_hl[i]
+    a = wp.quat_rotate(q[i], wp.vec3(0.0, 0.0, 1.0))
+    perp = s - a * wp.dot(s, a)
+    plen = wp.length(perp)
+    if plen > 1.0e-5:
+        d1 = -perp / plen
+    else:
+        tmp = wp.vec3(1.0, 0.0, 0.0)
+        if wp.abs(a[0]) > 0.9:
+            tmp = wp.vec3(0.0, 1.0, 0.0)
+        d1 = wp.normalize(wp.cross(a, tmp))
+    d2 = wp.normalize(wp.cross(a, d1))
+    for cap in range(2):
+        capoff = a * (wp.where(cap == 0, -1.0, 1.0) * hl)
+        for jj in range(4):
+            slot = i * 8 + cap * 4 + jj
+            lam_n = lam_floor[slot]
+            if lam_n == 0.0:
+                continue
+            if jj == 0:
+                dirv = d1
+            elif jj == 1:
+                dirv = d2
+            elif jj == 2:
+                dirv = d1 * (-1.0)
+            else:
+                dirv = d2 * (-1.0)
+            roff = capoff + dirv * r
+            vc = v[i] + wp.cross(omega[i], roff)
+            vn = wp.dot(vc, s)
+            vt = vc - s * vn
+            ltan = wp.length(vt)
+            impulse = wp.vec3(0.0, 0.0, 0.0)
+            if mu_d > 0.0 and ltan > EPS:
+                fn = lam_n / (h * h)
+                dvm = wp.min(h * mu_d * wp.abs(fn), ltan)
+                impulse = impulse - (vt / ltan) * dvm
+            if vn < 0.0:
+                impulse = impulse + s * (-vn + wp.max(-restitution * vn, 0.0))
+            if wp.length(impulse) > EPS:
+                w = gen_inv_mass(inv_mass[i], q[i], inv_I[i], roff, impulse / wp.length(impulse))
+                if w > 0.0:
+                    p = impulse / w
+                    wp.atomic_add(dv, i, p * inv_mass[i])
+                    wp.atomic_add(dw, i, world_invI_mul(q[i], inv_I[i], wp.cross(roff, p)))
+                    wp.atomic_add(dvc, i, 1)
 
 
 @wp.kernel

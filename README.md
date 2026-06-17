@@ -230,29 +230,112 @@ Profiling drove the order of attack (see `benchmark.py --profile`):
 
 The math is unchanged throughout — these are pure implementation optimizations.
 
+## Robot models — URDF & MJCF (`examples/viewer_robot.py`)
+
+Load a real robot description (Unitree **go2** ships in both formats) and view it
+in the browser. `xpbd3d.robot` parses **URDF** and **MJCF/MuJoCo XML** into one
+solver-agnostic `RobotModel` (links, joints, geometry + forward kinematics),
+ported from the C++ parsers in the renderer. It depends only on numpy + trimesh,
+so the same parsed model can later drive the solvers without re-parsing.
+
+```
+uv run python examples/viewer_robot.py --format mjcf --robot go2   # OBJ meshes
+uv run python examples/viewer_robot.py --format urdf --robot go2   # DAE meshes (pycollada)
+# open http://localhost:8080
+```
+
+Both robots are **Z-up** (the viewer sets viser's up to `+z`) and auto-lifted to
+stand on the grid. Drag the per-joint sliders to pose the legs (live FK), toggle
+**show collision** to overlay the collision primitives as a wireframe, or enable
+**animate** for a hands-free wiggle. The MJCF loader handles `<default>` class
+inheritance + `childclass`, `<include>`, and `meshdir`; the URDF loader resolves
+`package://` mesh paths.
+
+### XPBD physics on the robot (`examples/sim_robot_xpbd.py`)
+
+```
+uv run python examples/sim_robot_xpbd.py --format mjcf --scene hang   # base pinned, legs swing
+uv run python examples/sim_robot_xpbd.py --format urdf --scene drop   # base free, falls to floor
+```
+
+`robot/xpbd_build.py` maps the parsed model onto `Solver6DOF`:
+
+* Each rigid segment is mapped to a solver primitive taken **directly from the
+  file's collision geometry** (not a fitted bounding volume): `<box>` → box,
+  `<cylinder>` → **cylinder** (exact flat caps), `<sphere>` → sphere, `<capsule>`
+  → capsule, each with the geom's own radius/length and pose (go2 → 5 boxes for
+  the trunk/thighs + 8 cylinders for the hips/calves). One primitive (the
+  largest) per welded cluster is used; a secondary geom like the foot sphere
+  isn't a separate contact, so the calf cylinder provides the nearby ground
+  contact. Toggle **show physics shapes** to see the exact collision proxies next
+  to the visual meshes.
+* Links joined by **fixed** joints are welded into one rigid body (go2 → 13
+  bodies: base + 4×{hip,thigh,calf}); cosmetic links (rotors, head, feet) ride
+  along.
+* A **revolute** joint becomes **two** coincident-anchor `add_joint` distance
+  constraints along the hinge axis — pinning two points on the axis leaves one
+  free DOF (rotation about it). There's no motor/limit, so free hinges relax
+  under gravity. A base-pinned chain is an undamped pendulum, so `hang` applies a
+  little velocity damping (`ang_damp`/`lin_damp`, exposed as GUI sliders +
+  `--ang-damp`/`--lin-damp`) — without it the legs swing forever instead of
+  settling into a hanging rest pose.
+* **Self-collision via a per-body category/mask bitmask** (MuJoCo-style: two
+  bodies collide iff `cat[a] & mask[b]` *and* `cat[b] & mask[a]`). Each cluster
+  gets a unique category bit and a mask that clears its **joint-adjacent**
+  neighbours' bits, so adjacent links (which overlap at the shared hinge anchor)
+  never collide while every other link pair does — real inter-limb self-collision
+  without fighting the joints. A single integer `group` can't express this for a
+  serial chain (hip must skip thigh, thigh must skip calf, but hip *should* hit
+  calf), which is why the bitmask is needed; pass `self_collision=False` to fall
+  back to the old all-off single-group behaviour. The robot is rotated into the
+  solver's Y-up frame for the solve and back for rendering.
+
+The shape support lives in the solver itself (`add_box` / `add_capsule` /
+`add_sphere` / `add_cylinder`, shape-aware narrow phase) and stays **fully
+GPU-resident** — the per-substep loop is still one captured CUDA graph (0
+recaptures), since only manifold *generation* and the per-shape floor kernels are
+shape-aware while the XPBD contact *solve* is geometry-agnostic. The category/mask
+filter is read in the broad phase, which already runs outside the captured graph,
+so self-collision adds **zero** recaptures. A cylinder gets an exact
+flat-cap/rim/side floor contact; body-body cylinder contacts fall back to the
+capsule approximation (segment + radius).
+
+AVBD's `Solver6DOF` has no body-to-body joint — an articulated AVBD robot is
+still a separate decision.
+
 ## Layout
 
 ```
 src/xpbd3d/
 ├── solver.py        # Solver (3-DOF): scene, substep loop, vectorised grid broad phase
 ├── kernels.py       # 3-DOF Warp kernels: integrate, GS + Jacobi solves, friction
-├── solver_6dof.py   # Solver6DOF: rigid + particle + joint scene, LBVH broad phase, CUDA-graph step
-├── kernels_6dof.py  # 6-DOF kernels: integrate, OBB SAT manifold, contacts, joints, velocity solve
+├── solver_6dof.py   # Solver6DOF: box/capsule/sphere/cylinder + particle + joint scene, LBVH BP, CUDA-graph
+├── kernels_6dof.py  # 6-DOF kernels: integrate, OBB SAT + capsule manifolds, per-shape floor, contacts, joints
 ├── kernels_bvh.py   # GPU LBVH broad phase: per-body AABB + candidate-pair emission
 ├── kernels_hashgrid.py # GPU spatial-hash broad phase (wp.HashGrid) — the grid/tree A/B
 ├── coloring.py      # greedy constraint-graph coloring (3-DOF GS mode)
-└── scene.py         # Body / Shape / ConstraintHandle handles
+├── scene.py         # Body / Shape / ConstraintHandle handles
+└── robot/           # URDF + MJCF loaders → one RobotModel (numpy/trimesh only, no solver)
+    ├── model.py        # Link / Joint / Geometry dataclasses + forward kinematics
+    ├── transforms.py   # rpy/quat/euler → 4x4, mesh-path resolution (package:// & meshdir)
+    ├── urdf.py         # load_urdf()  — port of the renderer's UrdfParser
+    ├── mjcf.py         # load_mjcf()  — port of MjcfParser (default-class inheritance, include)
+    ├── viser_render.py # RobotView: per-link frames + visual/collision nodes, FK update
+    └── xpbd_build.py   # map RobotModel → Solver6DOF (box-per-cluster, hinge=2 distance joints)
 examples/
 ├── viewer.py        # 3-DOF viser viewer (chain / cloth / stack)
 ├── viewer_6dof.py   # 6-DOF viser viewer (stack / dominoes / domino_stress / unified / stress / mega)
+├── viewer_robot.py  # URDF/MJCF robot viewer — kinematics (FK joint sliders, visual/collision toggles)
+├── sim_robot_xpbd.py # URDF/MJCF robot under XPBD physics (hang / drop, OBB-box overlay)
 ├── cloth_drop.py    # headless cloth drape (--plot saves a 3D snapshot)
 ├── hanging_chain.py # headless chain (--plot saves a PNG)
 ├── smoke_test.py    # single-particle free fall sanity
 └── benchmark.py     # device timing sweep (3-DOF + 6-DOF + LBVH-vs-grid + unified) + profiler
 tests/
 ├── test_solver.py       # 14 tests (incl. compliance-iteration-independence, Fig. 2)
-└── test_solver_6dof.py  # 13 tests (free fall, floor rest, spin, stack, pile, tip, dominoes,
-                         #           LBVH==grid, joints, particles, cloth, unified)
+├── test_solver_6dof.py  # 16 tests (free fall, floor rest, spin, stack, pile, tip, dominoes,
+│                        #           LBVH==grid, joints, particles, cloth, unified, sphere/capsule rest)
+└── test_robot.py        # 6 tests (URDF/MJCF parse, FK, two-format agree, XPBD build+step, shape mix)
 reference/
 ├── XPBD_Macklin2016.pdf            # the 3-DOF / compliant-constraint paper
 └── Mueller2020_RigidBodyXPBD.pdf   # the 6-DOF rigid-body paper

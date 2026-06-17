@@ -9,6 +9,7 @@ dependencies = [
     "viser>=1.0.0",
     "warp-lang>=1.6.0",
     "trimesh>=4.4.0",
+    "pycollada>=0.8",
 ]
 
 [build-system]

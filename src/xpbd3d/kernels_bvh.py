@@ -55,6 +55,8 @@ def emit_pairs(
     uppers: wp.array(dtype=wp.vec3),
     inv_mass: wp.array(dtype=float),
     cgroup: wp.array(dtype=int),
+    ccat: wp.array(dtype=wp.uint64),     # collision category bits (per body)
+    cmask: wp.array(dtype=wp.uint64),    # collision mask bits (per body)
     cap: int,
     # in/out
     count: wp.array(dtype=int),          # atomic running pair count (also graph gate)
@@ -62,14 +64,17 @@ def emit_pairs(
     pair_b: wp.array(dtype=int),
 ):
     """For each body, query the LBVH with its (inflated) AABB and append every
-    overlapping ``j > i`` as a candidate pair. Drops static-static pairs and
-    same-no-self-collide-group pairs (e.g. cloth-vs-itself). Writes are clamped
-    to ``cap``; if ``count`` exceeds ``cap`` the host grows + re-emits."""
+    overlapping ``j > i`` as a candidate pair. Drops static-static pairs, same-
+    no-self-collide-group pairs (e.g. cloth-vs-itself), and pairs excluded by the
+    category/mask bitmask (MuJoCo-style: collide iff ``cat[i]&mask[j]`` and
+    ``cat[j]&mask[i]`` — used to skip joint-adjacent robot links). Writes are
+    clamped to ``cap``; if ``count`` exceeds ``cap`` the host grows + re-emits."""
     i = wp.tid()
     lo = lowers[i]
     hi = uppers[i]
     im = inv_mass[i]
     gi = cgroup[i]
+    zero = wp.uint64(0)
     query = wp.bvh_query_aabb(bvh, lo, hi)
     j = int(0)
     while wp.bvh_query_next(query, j):
@@ -78,6 +83,8 @@ def emit_pairs(
             keep = False
         if gi == cgroup[j] and gi > 0:           # same no-self-collide cluster
             keep = False
+        if ((ccat[i] & cmask[j]) == zero) or ((ccat[j] & cmask[i]) == zero):
+            keep = False                         # excluded pair (e.g. adjacent links)
         if keep:
             slot = wp.atomic_add(count, 0, 1)
             if slot < cap:

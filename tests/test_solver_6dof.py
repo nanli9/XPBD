@@ -11,6 +11,7 @@ import pytest
 import warp as wp
 
 from xpbd3d import Solver6DOF
+from xpbd3d.solver_6dof import FULL64
 
 wp.init()
 _HAS_CUDA = any(str(d).startswith("cuda") for d in wp.get_devices())
@@ -223,3 +224,56 @@ def test_domino_cascade():
         s.step()
     fell = int(np.sum(s.positions()[:, 1] < hh * 0.6))
     assert fell >= n - 1                          # the cascade propagated
+
+
+def test_sphere_rests_on_floor():
+    """Sphere (capsule with zero segment length) settles at y = radius."""
+    s = Solver6DOF(device="cpu", substeps=15, iterations=6, friction=0.0,
+                   restitution=0.0)
+    b = s.add_sphere((0.0, 0.6, 0.0), radius=0.12, mass=1.0)
+    for _ in range(150):
+        s.step()
+    assert abs(s.positions()[b.index][1] - 0.12) < 5e-3
+
+
+def test_capsule_rests_on_floor():
+    """Horizontal capsule (axis = body-local +Z = world Z) rests at y = radius."""
+    s = Solver6DOF(device="cpu", substeps=15, iterations=6, friction=0.0,
+                   restitution=0.0)
+    b = s.add_capsule((0.0, 0.6, 0.0), radius=0.06, half_len=0.2, mass=1.0)
+    for _ in range(150):
+        s.step()
+    assert abs(s.positions()[b.index][1] - 0.06) < 5e-3
+
+
+def test_two_spheres_rest_touching():
+    """Two spheres dropped side by side settle touching (centre distance ~2r)."""
+    s = Solver6DOF(device="cpu", substeps=15, iterations=8, friction=0.5)
+    a = s.add_sphere((-0.2, 0.1, 0.0), 0.1, 1.0)
+    b = s.add_sphere((0.2, 0.1, 0.0), 0.1, 1.0)
+    for _ in range(200):
+        s.step()
+    import numpy as np
+    d = float(np.linalg.norm(s.positions()[a.index] - s.positions()[b.index]))
+    assert 0.18 < d < 0.42                     # touching-ish, not exploded
+    assert np.abs(s.velocities()).max() < 0.1  # settled
+
+
+def test_collision_filter_excludes_pair():
+    """The category/mask bitmask suppresses one specific pair: two overlapping
+    spheres (no gravity) push apart by default, but pass through when their pair
+    is masked out — the mechanism robot self-collision uses to skip adjacent links."""
+    def run(mask_pair):
+        s = Solver6DOF(device=DEVICE, substeps=10, iterations=6,
+                       gravity=(0, 0, 0), floor_y=-100.0)
+        a = s.add_sphere((-0.08, 0.0, 0.0), 0.1, 1.0)
+        b = s.add_sphere((0.08, 0.0, 0.0), 0.1, 1.0)
+        if mask_pair:
+            s.set_collision_filter(a.index, 1 << a.index, FULL64 & ~(1 << b.index))
+            s.set_collision_filter(b.index, 1 << b.index, FULL64 & ~(1 << a.index))
+        for _ in range(60):
+            s.step()
+        return float(np.linalg.norm(s.positions()[a.index] - s.positions()[b.index]))
+
+    assert run(False) > 0.18      # collide → pushed apart toward 2r = 0.2
+    assert run(True) < 0.17       # masked → stayed overlapping (passed through)

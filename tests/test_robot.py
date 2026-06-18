@@ -66,9 +66,11 @@ def test_xpbd_build_and_step_stable():
     from xpbd3d.robot.xpbd_build import build_xpbd, link_world_transforms
 
     m = load_mjcf(MJCF)
-    phys = build_xpbd(m, base_static=True, device="cpu", substeps=10, iterations=6)
-    # Fixed joints are welded: 13 clusters (base + 4×{hip,thigh,calf}), and each
-    # revolute joint becomes two coincident-anchor (hinge) constraints.
+    # foot_contacts off here to isolate the clustering: fixed joints are welded
+    # into 13 clusters (base + 4×{hip,thigh,calf}), each revolute joint becoming
+    # two coincident-anchor (hinge) constraints.
+    phys = build_xpbd(m, base_static=True, device="cpu", substeps=10, iterations=6,
+                      foot_contacts=False)
     assert phys.solver.num_bodies == 13
     assert phys.solver.num_joints == 2 * len(m.actuated_joints)
     for _ in range(60):
@@ -82,9 +84,10 @@ def test_xpbd_build_and_step_stable():
 
 @pytest.mark.skipif(not _have_mjcf, reason="go2 MJCF not present")
 def test_xpbd_build_uses_file_shapes():
-    """Shapes are taken directly from the file's collision primitives: go2's
-    trunk/thighs are <box> → boxes, its hips/calves are <cylinder> → cylinders
-    (not capsule approximations)."""
+    """Shapes are taken directly from the file's collision primitives — and with
+    foot_contacts (default) the *full* set is represented: go2's trunk/thighs are
+    <box> → boxes, hips/calves are <cylinder> → cylinders (not capsules), and the
+    foot <sphere> geoms appear as **sphere** proxies (the foot balls)."""
     from xpbd3d.robot.xpbd_build import build_xpbd
 
     m = load_mjcf(MJCF)
@@ -94,6 +97,10 @@ def test_xpbd_build_uses_file_shapes():
         kinds.add({0: "box", 2: "cylinder"}.get(st, "sphere" if hl < 1e-6 else "capsule"))
     assert "cylinder" in kinds           # hips/calves are real cylinders
     assert "box" in kinds                # trunk/thighs are boxes
+    assert "sphere" in kinds             # the foot balls (<geom class="foot">)
+    # one sphere proxy per foot → at least the 4 feet are present
+    n_spheres = sum(1 for (_b, st, _h, _r, hl) in phys.proxies if st == 1 and hl < 1e-6)
+    assert n_spheres >= 4
     for _ in range(40):
         phys.solver.step()
     assert np.isfinite(phys.solver.positions()).all()
@@ -108,7 +115,9 @@ def test_self_collision_excludes_only_adjacent():
     from xpbd3d.robot.xpbd_build import build_xpbd
 
     m = load_mjcf(MJCF)
-    phys = build_xpbd(m, base_static=True, device="cpu", substeps=10, iterations=6)
+    # foot_contacts off to isolate the 13-cluster adjacency structure.
+    phys = build_xpbd(m, base_static=True, device="cpu", substeps=10, iterations=6,
+                      foot_contacts=False)
     s = phys.solver
     assert set(s._group) == {0}                  # group filter inert; bitmask governs
     cat = np.asarray(s._cat, np.uint64)

@@ -183,7 +183,7 @@ def build_xpbd(model: RobotModel, q0: dict | None = None, base_static: bool = Tr
                start_clearance: float = 0.06, group: int = 7,
                self_collision: bool = True,
                actuation: float | None = None, drive_lever: float = 0.06,
-               foot_contacts: bool = False,
+               foot_contacts: bool = True,
                **solver_kwargs) -> RobotPhysics:
     """Map ``model`` onto ``Solver6DOF``. See module docstring for the rigid-
     cluster / hinge / self-collision design.
@@ -194,7 +194,13 @@ def build_xpbd(model: RobotModel, q0: dict | None = None, base_static: bool = Tr
     existing ``add_joint`` — no solver change. ``None`` = passive free hinges (the
     legs relax under gravity); ``0.0`` = rigid lock (frozen pose); a small value
     (~1e-4) = a stiff-but-springy motor that lets the robot **stand stably** while
-    still flexing under load. The target pose is whatever ``q0`` encodes."""
+    still flexing under load. The target pose is whatever ``q0`` encodes.
+
+    ``foot_contacts`` (default on) represents the file's collision set **exactly**:
+    the largest primitive per cluster is the body, and every *other* collision
+    primitive (go2's foot sphere, the trunk's extra box/cylinder/sphere) becomes a
+    small body rigidly welded to it — so the robot collides on its real foot balls,
+    not just its calf cylinders."""
     from ..solver_6dof import Solver6DOF, FULL64
 
     # FK in world (Z-up), lift so the lowest collision vertex starts at clearance.

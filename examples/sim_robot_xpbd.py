@@ -159,7 +159,7 @@ class RobotSim:
             iterations=max(self.args.iterations, 10) if is_stand else self.args.iterations,
             friction=self.args.friction, lin_damp=lin, ang_damp=ang,
             actuation=(self._actuation if is_stand else None),
-            foot_contacts=is_stand,
+            foot_contacts=True,        # always show the file's real foot balls etc.
             start_clearance=(0.04 if is_stand else (0.12 if scene == "drop" else 0.06)))
         self.solver = self.phys.solver
         self.solver._flush()

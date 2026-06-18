@@ -182,7 +182,19 @@ def build_xpbd(model: RobotModel, q0: dict | None = None, base_static: bool = Tr
                density: float = 700.0, hinge_delta: float = 0.06,
                start_clearance: float = 0.06, group: int = 7,
                self_collision: bool = True,
+               actuation: float | None = None, drive_lever: float = 0.06,
+               foot_contacts: bool = False,
                **solver_kwargs) -> RobotPhysics:
+    """Map ``model`` onto ``Solver6DOF``. See module docstring for the rigid-
+    cluster / hinge / self-collision design.
+
+    ``actuation`` turns each passive hinge into a **position servo** that holds
+    its build-pose angle (``q0``): a compliant off-axis anchor pair acts as a
+    torsional spring about the hinge axis (lever ``drive_lever``), built from the
+    existing ``add_joint`` — no solver change. ``None`` = passive free hinges (the
+    legs relax under gravity); ``0.0`` = rigid lock (frozen pose); a small value
+    (~1e-4) = a stiff-but-springy motor that lets the robot **stand stably** while
+    still flexing under load. The target pose is whatever ``q0`` encodes."""
     from ..solver_6dof import Solver6DOF, FULL64
 
     # FK in world (Z-up), lift so the lowest collision vertex starts at clearance.
@@ -279,11 +291,13 @@ def build_xpbd(model: RobotModel, q0: dict | None = None, base_static: bool = Tr
         Mchild = fk_sim[j.child]                           # child link == cluster B root
         anchor = np.asarray(j.anchor, np.float64)
         pts = [Mchild @ np.append(anchor, 1.0)]
+        ax_world = None
         if j.actuated and j.type != "prismatic":
             ax = np.asarray(j.axis, np.float64)
             n = np.linalg.norm(ax)
             if n > 1e-9:
                 ax = ax / n
+                ax_world = Mchild[:3, :3] @ ax             # hinge axis in the sim frame
                 pts.append(Mchild @ np.append(anchor + hinge_delta * ax, 1.0))
         for Pw in pts:
             p = Pw[:3]
@@ -292,16 +306,98 @@ def build_xpbd(model: RobotModel, q0: dict | None = None, base_static: bool = Tr
             solver.add_joint(ia, ib, compliance=0.0, rest_length=0.0,
                              anchor_a=tuple(anchor_a), anchor_b=tuple(anchor_b))
 
+        # Actuation: a compliant off-axis anchor pair → a torsional spring that
+        # holds the joint at its q0 angle. Coincident at the build pose, it pulls
+        # the limb back when it twists about the hinge axis (a position servo).
+        if actuation is not None and ax_world is not None:
+            e = np.array([1.0, 0.0, 0.0]) if abs(ax_world[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+            t = np.cross(ax_world, e)
+            t = t / (np.linalg.norm(t) + 1e-12)
+            D = pts[0][:3] + drive_lever * t              # off-axis drive point
+            aa = R_a.T @ (D - cw_a)
+            ab = R_b.T @ (D - cw_b)
+            solver.add_joint(ia, ib, compliance=float(actuation), rest_length=0.0,
+                             anchor_a=tuple(aa), anchor_b=tuple(ab))
+
+    # Secondary contact shapes: a cluster's non-primary primitive collision geoms
+    # (e.g. the foot sphere when the calf cylinder is the primary) become small
+    # bodies rigidly welded to the cluster's main body, so the robot stands on its
+    # **feet** — not just on whichever single proxy happened to be largest.
+    extra_excl = {bidx: set() for bidx in cluster_body.values()}
+    sec_of_main = {}                                    # secondary body -> its main body
+    if foot_contacts:
+        for cid in sorted(members):
+            main_idx = cluster_body[cid]
+            cw_main, R_main = cluster_frame[cid]
+            primary = _primary_collision_geom(model, members[cid])
+            for lname in members[cid]:
+                for gi in model.links[lname].collisions:
+                    g = gi.geometry
+                    if g.kind not in ("box", "sphere", "cylinder", "capsule"):
+                        continue
+                    if primary is not None and lname == primary[0] and gi is primary[1]:
+                        continue                       # already the main body
+                    W = fk_sim[lname] @ gi.origin
+                    c = W[:3, 3]
+                    Rw = W[:3, :3]
+                    mass = max(0.05, 0.3 * density * _geom_volume(g))  # light contact proxy
+                    if g.kind == "box":
+                        half = 0.5 * np.asarray(g.box_size, float)
+                        sb = solver.add_box(tuple(c), tuple(half), mass=mass,
+                                            quaternion=_quat_xyzw(W), color=(0.95, 0.6, 0.2))
+                        solver._group[sb.index] = body_group; sb.group = body_group
+                        proxies.append((sb.index, 0, tuple(float(x) for x in half), 0.0, 0.0))
+                        Rsb = Rw
+                    elif g.kind == "sphere":
+                        sb = solver.add_sphere(tuple(c), float(g.radius), mass=mass,
+                                               color=(0.95, 0.6, 0.2), group=body_group)
+                        proxies.append((sb.index, 1, None, float(g.radius), 0.0))
+                        Rsb = np.eye(3)                # sphere body frame is world-aligned
+                    elif g.kind == "cylinder":
+                        hl = 0.5 * float(g.length)
+                        sb = solver.add_cylinder(tuple(c), float(g.radius), hl, mass=mass,
+                                                 quaternion=_quat_xyzw(W), color=(0.95, 0.6, 0.2),
+                                                 group=body_group)
+                        proxies.append((sb.index, 2, None, float(g.radius), hl))
+                        Rsb = Rw
+                    else:
+                        hl = 0.5 * float(g.length)
+                        sb = solver.add_capsule(tuple(c), float(g.radius), hl, mass=mass,
+                                                quaternion=_quat_xyzw(W), color=(0.95, 0.6, 0.2),
+                                                group=body_group)
+                        proxies.append((sb.index, 1, None, float(g.radius), hl))
+                        Rsb = Rw
+                    # rigid weld to the main body: 3 non-collinear coincident points.
+                    for off in (np.zeros(3), 0.03 * Rw[:, 0], 0.03 * Rw[:, 1]):
+                        P = c + off
+                        solver.add_joint(main_idx, sb.index, compliance=0.0, rest_length=0.0,
+                                         anchor_a=tuple(R_main.T @ (P - cw_main)),
+                                         anchor_b=tuple(Rsb.T @ (P - c)))
+                    extra_excl[main_idx].add(sb.index)
+                    sec_of_main[sb.index] = main_idx
+
     # Self-collision filter: each cluster gets a unique category bit; its mask
     # clears its own bit and every joint-adjacent neighbour's bit, so adjacent
     # links (which overlap at the shared hinge anchor) never collide while all
     # other link pairs do — real self-collision without fighting the joints.
+    # Secondary contact bodies inherit their main body's exclusions (so a foot
+    # never collides its own calf/thigh) but otherwise collide the world.
+    use_bits = use_bits and solver.num_bodies <= 64
     if use_bits:
         for bidx, nbrs in adj.items():
             excl = (1 << bidx)
             for nb in nbrs:
                 excl |= (1 << nb)
+            for sb in extra_excl[bidx]:
+                excl |= (1 << sb)
             solver.set_collision_filter(bidx, 1 << bidx, FULL64 & ~excl)
+        for sb, main_idx in sec_of_main.items():
+            excl = (1 << sb) | (1 << main_idx)
+            for nb in adj[main_idx]:
+                excl |= (1 << nb)
+            for sib in extra_excl[main_idx]:
+                excl |= (1 << sib)
+            solver.set_collision_filter(sb, 1 << sb, FULL64 & ~excl)
 
     return RobotPhysics(solver=solver, render=render, proxies=proxies,
                         base_static=base_static)

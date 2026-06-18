@@ -132,6 +132,35 @@ def test_self_collision_excludes_only_adjacent():
 
 
 @pytest.mark.skipif(not _have_mjcf, reason="go2 MJCF not present")
+def test_actuated_robot_stands():
+    """An actuated go2 (joint position servos + foot contacts) holds itself up
+    under gravity with a *free* base, where the passive robot collapses to the
+    floor. Runs on CPU (GPU-independent)."""
+    from xpbd3d.robot.xpbd_build import build_xpbd
+
+    m = load_mjcf(MJCF)
+    q0 = {j.name: (0.9 if "thigh" in j.name.lower()
+                   else -1.8 if "calf" in j.name.lower() else 0.0)
+          for j in m.actuated_joints}
+
+    def settled_base_height(actuation, feet):
+        phys = build_xpbd(m, q0=q0, base_static=False, device="cpu", substeps=10,
+                          iterations=8, friction=0.9, lin_damp=0.005, ang_damp=0.02,
+                          actuation=actuation, foot_contacts=feet, start_clearance=0.04)
+        bidx = phys.render[m.root][0]                  # base body, +y is up in sim frame
+        for _ in range(90):
+            phys.solver.step()
+        pos = phys.solver.positions()
+        return float(pos[bidx][1]), bool(np.isfinite(pos).all())
+
+    h_passive, ok_p = settled_base_height(None, False)   # free hinges → collapses
+    h_stand, ok_s = settled_base_height(1e-6, True)       # servos + feet → stands
+    assert ok_p and ok_s
+    assert h_stand > 0.18                                  # standing tall on its feet
+    assert h_stand > h_passive + 0.1                       # clearly above the collapsed pose
+
+
+@pytest.mark.skipif(not _have_mjcf, reason="go2 MJCF not present")
 def test_registry_discovers_models():
     """Model discovery finds loadable robots with unique labels, and go2 (the
     model both viewers default to) is among them."""

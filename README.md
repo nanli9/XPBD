@@ -261,8 +261,9 @@ hot-swaps the live simulation).
 ### XPBD physics on the robot (`examples/sim_robot_xpbd.py`)
 
 ```
-uv run python examples/sim_robot_xpbd.py --format mjcf --scene hang   # base pinned, legs swing
-uv run python examples/sim_robot_xpbd.py --format urdf --scene drop   # base free, falls to floor
+uv run python examples/sim_robot_xpbd.py --format mjcf --scene hang    # base pinned, legs swing
+uv run python examples/sim_robot_xpbd.py --format urdf --scene drop    # base free, falls to floor
+uv run python examples/sim_robot_xpbd.py --format mjcf --scene stand   # actuated: stands on its feet
 ```
 
 `robot/xpbd_build.py` maps the parsed model onto `Solver6DOF`:
@@ -271,21 +272,28 @@ uv run python examples/sim_robot_xpbd.py --format urdf --scene drop   # base fre
   file's collision geometry** (not a fitted bounding volume): `<box>` → box,
   `<cylinder>` → **cylinder** (exact flat caps), `<sphere>` → sphere, `<capsule>`
   → capsule, each with the geom's own radius/length and pose (go2 → 5 boxes for
-  the trunk/thighs + 8 cylinders for the hips/calves). One primitive (the
-  largest) per welded cluster is used; a secondary geom like the foot sphere
-  isn't a separate contact, so the calf cylinder provides the nearby ground
-  contact. Toggle **show physics shapes** to see the exact collision proxies next
-  to the visual meshes.
+  the trunk/thighs + 8 cylinders for the hips/calves). The largest primitive per
+  welded cluster is the body; with `foot_contacts=True` the remaining primitives
+  (e.g. the foot sphere) become small **rigidly-welded contact bodies** so the
+  robot stands on its **feet**, not its shins. Toggle **show physics shapes** to
+  see the exact collision proxies next to the visual meshes.
 * Links joined by **fixed** joints are welded into one rigid body (go2 → 13
   bodies: base + 4×{hip,thigh,calf}); cosmetic links (rotors, head, feet) ride
   along.
 * A **revolute** joint becomes **two** coincident-anchor `add_joint` distance
   constraints along the hinge axis — pinning two points on the axis leaves one
-  free DOF (rotation about it). There's no motor/limit, so free hinges relax
-  under gravity. A base-pinned chain is an undamped pendulum, so `hang` applies a
-  little velocity damping (`ang_damp`/`lin_damp`, exposed as GUI sliders +
-  `--ang-damp`/`--lin-damp`) — without it the legs swing forever instead of
-  settling into a hanging rest pose.
+  free DOF (rotation about it). By default the hinge is **passive** (no motor), so
+  it relaxes under gravity; a base-pinned chain is then an undamped pendulum, so
+  `hang` applies a little velocity damping (`ang_damp`/`lin_damp`, GUI sliders +
+  `--ang-damp`/`--lin-damp`) so the legs settle instead of swinging forever.
+* **Joint actuation** (`actuation=`, the `stand` scene) turns each passive hinge
+  into a **position servo** that holds its build-pose angle: a *compliant off-axis
+  anchor pair* acts as a torsional spring about the hinge axis — built purely from
+  the existing `add_joint`, **no solver change**. `None` = passive, `0.0` = rigid
+  lock, a small compliance (~`1e-6`) = a stiff-but-springy motor. With servos +
+  foot contacts the free-base go2 **stands stably on its feet** (base holds ~0.28 m)
+  where the passive robot collapses to the floor; the "motor compliance" slider
+  tunes stiffness live.
 * **Self-collision via a per-body category/mask bitmask** (MuJoCo-style: two
   bodies collide iff `cat[a] & mask[b]` *and* `cat[b] & mask[a]`). Each cluster
   gets a unique category bit and a mask that clears its **joint-adjacent**

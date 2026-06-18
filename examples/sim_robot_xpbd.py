@@ -24,8 +24,11 @@ quadrupeds behave most naturally.)
 * drop — base free; the whole robot falls and its shape proxies land on the floor.
 * stand — base free, but each joint is an **actuated position servo** (a compliant
   off-axis drive that holds the home pose) and the foot spheres contact the floor,
-  so the robot holds itself up and **stands stably** instead of collapsing. The
-  "motor compliance" slider tunes servo stiffness (0 = rigid, larger = softer).
+  so the robot holds itself up and **stands stably** instead of collapsing.
+  Rigidity knobs (stiffest → softest): lower **motor compliance** (0 = rigid lock),
+  raise **iterations** and **substeps** (XPBD only becomes rigid once the serial
+  leg chain converges — these matter most). Stand defaults to 20 iters / 28
+  substeps / 2e-7 compliance.
 
 Note on self-intersection: all robot links share one collision ``group`` so the
 solver runs **no link-vs-link self-collision** (a single-int group can't exclude
@@ -147,16 +150,25 @@ class RobotSim:
             ang = self.args.ang_damp
         return lin, ang
 
+    def _scene_solver(self, scene: str):
+        """(substeps, iterations) per scene. ``stand`` uses more of both: the leg
+        is a 3-deep serial chain (base→hip→thigh→calf) + foot welds, and XPBD
+        constraints only become *rigid* once the solver converges — so iterations
+        and substeps are the dominant stiffness knobs, more than the compliance."""
+        if scene == "stand":
+            return max(self.args.substeps, 28), max(self.args.iterations, 20)
+        return self.args.substeps, self.args.iterations
+
     def _build_physics(self, scene: str):
         self.scene = scene
         q0 = home_pose(self.model)
         lin, ang = self._scene_damping(scene)
+        sub, iters = self._scene_solver(scene)
         is_stand = scene == "stand"
         # stand: free base, joint servos hold the home pose, feet contact the floor.
         self.phys = build_xpbd(
             self.model, q0=q0, base_static=(scene == "hang"),
-            device=self.args.device, substeps=self.args.substeps,
-            iterations=max(self.args.iterations, 10) if is_stand else self.args.iterations,
+            device=self.args.device, substeps=sub, iterations=iters,
             friction=self.args.friction, lin_damp=lin, ang_damp=ang,
             actuation=(self._actuation if is_stand else None),
             foot_contacts=True,        # always show the file's real foot balls etc.
@@ -196,15 +208,17 @@ class RobotSim:
             self.g_scene = self.server.gui.add_dropdown("scene", ("hang", "drop", "stand"),
                                                         initial_value=self.scene)
             self.g_reset = self.server.gui.add_button("reset")
-            self.g_substeps = self.server.gui.add_slider("substeps", 5, 40, 1, a.substeps)
-            self.g_iters = self.server.gui.add_slider("iterations", 1, 16, 1, a.iterations)
+            sub0, it0 = self._scene_solver(self.scene)
+            self.g_substeps = self.server.gui.add_slider("substeps", 5, 40, 1, sub0)
+            self.g_iters = self.server.gui.add_slider("iterations", 1, 24, 1, it0)
             self.g_gravity = self.server.gui.add_slider("gravity", -20.0, 0.0, 0.5, -9.81)
             self.g_friction = self.server.gui.add_slider("friction μ", 0.0, 1.5, 0.05, a.friction)
             lin0, ang0 = self._scene_damping(self.scene)
             self.g_lindamp = self.server.gui.add_slider("linear damping", 0.0, 0.1, 0.005, lin0)
             self.g_angdamp = self.server.gui.add_slider("angular damping", 0.0, 0.1, 0.005, ang0)
             self.g_motor = self.server.gui.add_slider(
-                "motor compliance ×1e-6 (stand)", 0.0, 20.0, 0.5, self._actuation / 1e-6)
+                "motor compliance ×1e-6 (stand; lower=stiffer)", 0.0, 10.0, 0.1,
+                self._actuation / 1e-6)
         with self.server.gui.add_folder("Display"):
             self.g_visual = self.server.gui.add_checkbox("show visual", True)
             self.g_collision = self.server.gui.add_checkbox("show collision", False)
@@ -276,10 +290,13 @@ class RobotSim:
         with self._lock:
             self._build_physics(scene)
             lin0, ang0 = self._scene_damping(scene)
+            sub0, it0 = self._scene_solver(scene)
             self.g_lindamp.value = lin0
             self.g_angdamp.value = ang0
-            self.solver.substeps = int(self.g_substeps.value)
-            self.solver.iterations = int(self.g_iters.value)
+            self.g_substeps.value = sub0          # stand bumps these up for rigidity
+            self.g_iters.value = it0
+            self.solver.substeps = sub0
+            self.solver.iterations = it0
             self.solver.gravity = (0.0, float(self.g_gravity.value), 0.0)
             self.solver.friction = float(self.g_friction.value)
             self.solver.lin_damp = lin0
@@ -329,7 +346,7 @@ def main():
     p.add_argument("--robot", default="go2")
     p.add_argument("--path", default=None)
     p.add_argument("--scene", choices=["hang", "drop", "stand"], default="hang")
-    p.add_argument("--actuation", type=float, default=1e-6,
+    p.add_argument("--actuation", type=float, default=2e-7,
                    help="joint-servo compliance for the stand scene (smaller=stiffer, 0=rigid)")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--substeps", type=int, default=20)

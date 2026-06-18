@@ -15,9 +15,11 @@ from xpbd3d.robot import load_mjcf, load_urdf
 
 MJCF = "/home/nan/Desktop/unitree_robots/go2/go2.xml"
 URDF = "/home/nan/Desktop/urdf/go2_description/urdf/go2_description.urdf"
+H2_URDF = "/home/nan/Desktop/urdf/h2_description/H2.urdf"
 
 _have_mjcf = os.path.exists(MJCF)
 _have_urdf = os.path.exists(URDF)
+_have_h2 = os.path.exists(H2_URDF)
 
 
 @pytest.mark.skipif(not _have_mjcf, reason="go2 MJCF not present")
@@ -183,6 +185,47 @@ def test_registry_discovers_models():
     assert any(e.label == "go2 [mjcf]" for e in models)
     # the CLI default path resolves back to a discovered entry
     assert entry_for_path(models, "mjcf", MJCF) is not None
+
+
+@pytest.mark.skipif(not _have_h2, reason="H2 URDF not present")
+def test_h2_collision_proxies_match_file():
+    """The H2 humanoid's solver collision proxies mirror its URDF collision set
+    **exactly**: one drawn/solved proxy per ``<collision>`` geom (the file's 2
+    spheres + 2 cylinders stay exact primitives; mesh collisions become a tight
+    box — the closest a box-only solver can come to an STL), and every link the
+    file deliberately leaves *without* collision (wrists, hip-pitch, ankle-roll,
+    waist, head-pitch — all commented out) becomes a **non-colliding** body that
+    still carries mass and articulates but generates no contact at all. No
+    bounding boxes are fabricated from visual meshes."""
+    from xpbd3d.robot.xpbd_build import build_xpbd
+    from xpbd3d.solver_6dof import NONCOLLIDING
+
+    m = load_urdf(H2_URDF)
+    file_kinds = [gi.geometry.kind for link in m.links.values() for gi in link.collisions]
+    n_no_collision = sum(1 for link in m.links.values() if not link.collisions)
+
+    phys = build_xpbd(m, base_static=True, device="cpu", substeps=10, iterations=6)
+    s = phys.solver
+
+    # exactly one proxy per file collision geom — nothing invented, nothing dropped.
+    assert len(phys.proxies) == len(file_kinds)
+    n_sphere = sum(1 for (_b, st, _h, _r, hl) in phys.proxies if st == 1 and hl < 1e-6)
+    n_cyl = sum(1 for (_b, st, _h, _r, _hl) in phys.proxies if st == 2)
+    assert n_sphere == file_kinds.count("sphere")        # 2 hip-roll spheres, exact
+    assert n_cyl == file_kinds.count("cylinder")         # 2 knee cylinders, exact
+
+    # links with no <collision> → non-colliding bodies (cat=0 + sentinel shape).
+    cat = np.asarray(s._cat, np.uint64)
+    stype = np.asarray(s._shape_type, np.int32)
+    noncolliding = {i for i, c in enumerate(cat) if c == 0}
+    assert len(noncolliding) == n_no_collision
+    assert int((stype == NONCOLLIDING).sum()) == n_no_collision
+    # none of those bodies appear among the drawn/solved proxies.
+    assert all(b not in noncolliding for (b, *_rest) in phys.proxies)
+
+    for _ in range(60):
+        s.step()
+    assert np.isfinite(s.positions()).all()
 
 
 @pytest.mark.skipif(not (_have_mjcf and _have_urdf), reason="need both descriptions")

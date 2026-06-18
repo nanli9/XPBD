@@ -40,6 +40,11 @@ from . import kernels_hashgrid as KH
 from .solver import _grid_candidate_pairs
 
 FULL64 = (1 << 64) - 1          # all collision-category/mask bits set (collide all)
+NONCOLLIDING = -1               # shape_type sentinel: no floor/box/capsule kernel
+                                # claims it (each guards on shape_type == 0/1/2), so
+                                # the body carries mass + articulates but never
+                                # generates a contact. Used for links a source file
+                                # leaves without any <collision> geometry.
 
 
 @dataclass
@@ -292,6 +297,20 @@ class Solver6DOF:
         joint-adjacent robot links while still colliding the rest of the linkage."""
         self._cat[int(idx)] = int(category) & FULL64
         self._mask[int(idx)] = int(mask) & FULL64
+        self._dirty = True
+
+    def set_noncolliding(self, idx):
+        """Make a body articulate and carry mass but generate **no contacts** —
+        the faithful representation of a link whose source file gives no
+        ``<collision>`` geometry. Body-body contacts are removed by zeroing the
+        collision category/mask (it never enters a broad-phase pair); the floor
+        kernels skip it because its ``shape_type`` (``NONCOLLIDING``) matches none
+        of their ``== 0/1/2`` guards. No contact math changes."""
+        i = int(idx)
+        self._cat[i] = 0
+        self._mask[i] = 0
+        self._shape_type[i] = int(NONCOLLIDING)
+        self.bodies[i].shape_type = int(NONCOLLIDING)
         self._dirty = True
 
     # ---- broad phase (legacy grid; LBVH path is on device in step) ----------

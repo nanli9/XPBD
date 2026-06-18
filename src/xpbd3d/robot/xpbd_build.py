@@ -122,39 +122,41 @@ def _primary_collision_geom(model, member_links):
     return best
 
 
-def _cluster_aabb(model, member_links, root_name, fk_sim):
-    """AABB (lo, hi) over the cluster's collision geometry in the root sim frame
-    (visual as a fallback)."""
+def _cluster_aabb(model, member_links, root_name, fk_sim, use_collision):
+    """AABB ``(lo, hi, found)`` over the cluster's *collision* (or *visual*)
+    geometry, expressed in the root sim frame."""
     Minv_root = np.linalg.inv(fk_sim[root_name])
     lo = np.full(3, np.inf)
     hi = np.full(3, -np.inf)
     found = False
-    for use_collision in (True, False):
-        for lname in member_links:
-            geoms = model.links[lname].collisions if use_collision else model.links[lname].visuals
-            for gi in geoms:
-                m = gi.geometry.to_trimesh()
-                if m is None or len(m.vertices) == 0:
-                    continue
-                W = Minv_root @ fk_sim[lname] @ gi.origin
-                v = np.asarray(m.vertices, np.float64) @ W[:3, :3].T + W[:3, 3]
-                lo = np.minimum(lo, v.min(axis=0))
-                hi = np.maximum(hi, v.max(axis=0))
-                found = True
-        if found:
-            break
-    if not found:
-        return np.full(3, -0.02), np.full(3, 0.02)
-    return lo, hi
+    for lname in member_links:
+        geoms = model.links[lname].collisions if use_collision else model.links[lname].visuals
+        for gi in geoms:
+            m = gi.geometry.to_trimesh()
+            if m is None or len(m.vertices) == 0:
+                continue
+            W = Minv_root @ fk_sim[lname] @ gi.origin
+            v = np.asarray(m.vertices, np.float64) @ W[:3, :3].T + W[:3, 3]
+            lo = np.minimum(lo, v.min(axis=0))
+            hi = np.maximum(hi, v.max(axis=0))
+            found = True
+    return lo, hi, found
 
 
 def _cluster_shape(model, member_links, root_name, fk_sim):
     """Map a rigid cluster onto a solver shape, taken **directly from the file's
-    collision geometry** — the largest collision primitive's own dimensions and
-    pose, not a fitted bounding volume. A ``<cylinder>``/``<capsule>`` geom →
-    capsule (its radius/length, axis = the geom's local +Z), ``<sphere>`` → sphere,
-    ``<box>`` → box. Falls back to an AABB box only for mesh-only clusters.
-    Returns ``{kind, B0 (4x4 body frame, sim), half | radius | half_len}``.
+    collision geometry**. A ``<cylinder>``/``<capsule>`` geom → capsule (its
+    radius/length, axis = the geom's local +Z), ``<sphere>`` → sphere, ``<box>`` →
+    box — each with the geom's own dimensions and pose, not a fitted bounding
+    volume. A cluster whose only collision geometry is a **mesh** gets a tight box
+    of *that collision mesh* (the closest a box-only solver can come to an STL).
+
+    A cluster the file gives **no ``<collision>`` at all** (H2 deliberately
+    comments out wrists, hip-pitch, ankle-roll, waist, head-pitch) must collide
+    with nothing: it still needs a rigid body for the articulation, so we size it
+    from the *visual* bounds (for sensible inertia) but mark it ``collidable=
+    False`` — the caller makes that body non-colliding. Returns ``{kind, B0,
+    half | radius | half_len, collidable}``.
     """
     prim = _primary_collision_geom(model, member_links)
     if prim is not None:
@@ -162,20 +164,31 @@ def _cluster_shape(model, member_links, root_name, fk_sim):
         B0 = fk_sim[owner] @ gi.origin          # the geom's own pose in the sim frame
         g = gi.geometry
         if g.kind == "box":
-            return {"kind": "box", "B0": B0, "half": 0.5 * np.asarray(g.box_size, float)}
+            return {"kind": "box", "B0": B0, "half": 0.5 * np.asarray(g.box_size, float),
+                    "collidable": True}
         if g.kind == "sphere":
-            return {"kind": "sphere", "B0": B0, "radius": float(g.radius)}
+            return {"kind": "sphere", "B0": B0, "radius": float(g.radius), "collidable": True}
         if g.kind == "cylinder":            # exact cylinder (flat caps), axis = geom +Z
             return {"kind": "cylinder", "B0": B0, "radius": float(g.radius),
-                    "half_len": 0.5 * float(g.length)}
+                    "half_len": 0.5 * float(g.length), "collidable": True}
         # capsule → solver capsule along the geom's local +Z axis
         return {"kind": "capsule", "B0": B0, "radius": float(g.radius),
-                "half_len": 0.5 * float(g.length)}
-    # mesh-only cluster: no usable primitive → AABB box fallback
-    lo, hi = _cluster_aabb(model, member_links, root_name, fk_sim)
+                "half_len": 0.5 * float(g.length), "collidable": True}
+    # mesh-collision cluster: tight box of the collision mesh (collidable).
+    lo, hi, found = _cluster_aabb(model, member_links, root_name, fk_sim, use_collision=True)
+    if found:
+        center = 0.5 * (lo + hi)
+        half = np.maximum(0.5 * (hi - lo), 0.005)
+        return {"kind": "box", "B0": fk_sim[root_name] @ T.translation(center),
+                "half": half, "collidable": True}
+    # no collision geometry in the file → non-colliding body sized from visuals.
+    lo, hi, found = _cluster_aabb(model, member_links, root_name, fk_sim, use_collision=False)
+    if not found:
+        lo, hi = np.full(3, -0.02), np.full(3, 0.02)
     center = 0.5 * (lo + hi)
     half = np.maximum(0.5 * (hi - lo), 0.005)
-    return {"kind": "box", "B0": fk_sim[root_name] @ T.translation(center), "half": half}
+    return {"kind": "box", "B0": fk_sim[root_name] @ T.translation(center),
+            "half": half, "collidable": False}
 
 
 def build_xpbd(model: RobotModel, q0: dict | None = None, base_static: bool = True,
@@ -203,17 +216,27 @@ def build_xpbd(model: RobotModel, q0: dict | None = None, base_static: bool = Tr
     not just its calf cylinders."""
     from ..solver_6dof import Solver6DOF, FULL64
 
-    # FK in world (Z-up), lift so the lowest collision vertex starts at clearance.
+    # FK in world (Z-up), lift so the lowest *collision* vertex starts at
+    # clearance — the robot rests on its real collision set, never on a
+    # non-colliding visual (a hanging hand) that happens to dip lower. Visuals are
+    # only a fallback if the file has no collision geometry anywhere.
     fk_world = model.forward_kinematics(q0)
-    min_up = np.inf
-    for lname, link in model.links.items():
-        for gi in (link.collisions or link.visuals):
-            m = gi.geometry.to_trimesh()
-            if m is None or len(m.vertices) == 0:
-                continue
-            W = fk_world[lname] @ gi.origin
-            z = (np.asarray(m.vertices, np.float64) @ W[:3, :3].T + W[:3, 3])[:, 2]
-            min_up = min(min_up, float(z.min()))
+
+    def _lowest(use_collision):
+        lo = np.inf
+        for lname, link in model.links.items():
+            for gi in (link.collisions if use_collision else link.visuals):
+                m = gi.geometry.to_trimesh()
+                if m is None or len(m.vertices) == 0:
+                    continue
+                W = fk_world[lname] @ gi.origin
+                z = (np.asarray(m.vertices, np.float64) @ W[:3, :3].T + W[:3, 3])[:, 2]
+                lo = min(lo, float(z.min()))
+        return lo
+
+    min_up = _lowest(True)
+    if not np.isfinite(min_up):
+        min_up = _lowest(False)
     dz = (start_clearance - min_up) if np.isfinite(min_up) else 0.0
     lift = T.translation((0.0, 0.0, dz))
     fk_sim = {k: _TO_SIM @ lift @ M for k, M in fk_world.items()}
@@ -235,10 +258,12 @@ def build_xpbd(model: RobotModel, q0: dict | None = None, base_static: bool = Tr
 
     # One shape (box / capsule / sphere) per rigid cluster.
     cluster_body, cluster_frame, proxies = {}, {}, []
+    noncolliding = set()                        # bodies the file gives no collision
     render = {}
     for cid in sorted(members):
         root = roots[cid]
         shp = _cluster_shape(model, members[cid], root, fk_sim)
+        collidable = shp.get("collidable", True)
         B0 = shp["B0"]                          # body frame = the collision geom's pose
         cw = B0[:3, 3]
         R_body = B0[:3, :3]
@@ -252,7 +277,7 @@ def build_xpbd(model: RobotModel, q0: dict | None = None, base_static: bool = Tr
             rb = solver.add_cylinder(tuple(cw), r, hl, mass=mass,
                                      quaternion=_quat_xyzw(B0), static=is_static,
                                      color=color, group=body_group)
-            proxies.append((None, 2, None, r, hl))
+            prox = (rb.index, 2, None, r, hl)
         elif shp["kind"] == "capsule":
             r, hl = shp["radius"], shp["half_len"]
             if mass <= 0.0:
@@ -261,14 +286,14 @@ def build_xpbd(model: RobotModel, q0: dict | None = None, base_static: bool = Tr
             rb = solver.add_capsule(tuple(cw), r, hl, mass=mass,
                                     quaternion=_quat_xyzw(B0), static=is_static,
                                     color=color, group=body_group)
-            proxies.append((None, 1, None, r, hl))
+            prox = (rb.index, 1, None, r, hl)
         elif shp["kind"] == "sphere":
             r = shp["radius"]
             if mass <= 0.0:
                 mass = max(0.02, density * float(4.0 / 3.0 * np.pi * r ** 3))
             rb = solver.add_sphere(tuple(cw), r, mass=mass, static=is_static,
                                    color=color, group=body_group)
-            proxies.append((None, 1, None, r, 0.0))
+            prox = (rb.index, 1, None, r, 0.0)
         else:
             half = shp["half"]
             if mass <= 0.0:
@@ -278,8 +303,14 @@ def build_xpbd(model: RobotModel, q0: dict | None = None, base_static: bool = Tr
                                 color=color)
             solver._group[rb.index] = int(body_group)      # box: set the group manually
             rb.group = int(body_group)
-            proxies.append((None, 0, tuple(float(x) for x in half), 0.0, 0.0))
-        proxies[-1] = (rb.index,) + proxies[-1][1:]
+            prox = (rb.index, 0, tuple(float(x) for x in half), 0.0, 0.0)
+        if collidable:
+            proxies.append(prox)                # only real collision geometry is drawn/solved
+        else:
+            # link has no <collision> in the file: keep the body (mass +
+            # articulation) but make it generate no contacts at all.
+            solver.set_noncolliding(rb.index)
+            noncolliding.add(rb.index)
         cluster_body[cid] = rb.index
         cluster_frame[cid] = (np.asarray(cw), R_body)
         B0inv = np.linalg.inv(B0)
@@ -391,6 +422,8 @@ def build_xpbd(model: RobotModel, q0: dict | None = None, base_static: bool = Tr
     use_bits = use_bits and solver.num_bodies <= 64
     if use_bits:
         for bidx, nbrs in adj.items():
+            if bidx in noncolliding:
+                continue                       # leave cat=0 (no contacts) as set above
             excl = (1 << bidx)
             for nb in nbrs:
                 excl |= (1 << nb)
